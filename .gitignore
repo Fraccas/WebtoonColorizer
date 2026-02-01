@@ -1,7 +1,6 @@
 .env
 /node_modules
 /dist
-/input
-/output
 .claude
 /tmp
+/debug
