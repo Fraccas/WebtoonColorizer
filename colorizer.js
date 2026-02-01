@@ -29,12 +29,14 @@ const MAX_SEGMENT_H = 4000;
 const MIN_SEGMENT_H = 100;
 
 const PROMPT = `
-Colorize this black-and-white webtoon/manga art.
+COLORIZE THIS BLACK-AND-WHITE WEBTOON PANEL.
 
-STRICT:
-- Preserve original line art, screentones, and composition exactly.
-- Do not change any text, bubbles, or SFX.
-- Do not add/remove objects or characters.
+STRICT PRESERVATION RULES:
+- Preserve the original line art exactly; do NOT redraw, re-ink, or change shapes.
+- Preserve screentones/halftone dots and texture; do NOT smooth them away.
+- Preserve all panel composition, perspective, facial structure, and clothing design.
+- Keep deep blacks rich and clean; do not gray them out.
+- Do not add new objects, text, symbols, or background elements.
 - Any area that is solid black in the input MUST stay pure black (#000000). Do not tint, colorize, or lighten black panel dividers or black backgrounds.
 
 COLOR STYLE:
@@ -42,12 +44,13 @@ COLOR STYLE:
 - No sepia / beige / vintage / parchment / "aged paper" look.
 - No global color grading or color cast.
 - Speech bubbles and highlights must remain neutral white (#FFFFFF); use them as white balance reference.
-- Shadows neutral-to-cool (slight blue/purple), not warm brown.
-- Increase saturation and contrast moderately.
+- Clean cel-shading with soft gradient transitions.
+- Crisp edges, minimal color bleed across line boundaries.
+- If unsure about a color, keep it neutral rather than inventing bright colors.
 
-CHARACTERS:
-- Hiro (young male): light Korean complexion, black hair, white shirt, brown apron, blue pants.
-- Old lady (Ms. Chan): gray hair, tan shirt, dark blue long skirt.
+PALETTE LOCKS (MUST FOLLOW):
+- Hiro (young male): light Korean complexion, black hair (#1A1A1A), white shirt (#FFFFFF), brown apron (#8B5E3C), blue pants (#3A5FAE).
+- Ms. Chan (old lady): gray hair (#A0A0A0), tan shirt (#C9A87C), dark blue long skirt (#2B3A67).
 - Keep these character colors consistent across all panels.
 `.trim();
 
@@ -248,6 +251,41 @@ async function isBlankSegment(buf) {
   return darkCount / total >= 0.98;
 }
 
+// ── Post-process: restore black pixels from original ─────────────────────
+// Any pixel that was black in the original input gets forced back to black
+// in the colorized output. This guarantees dividers/backgrounds stay pure black
+// regardless of what the AI does.
+
+async function restoreBlacks(originalBuf, colorizedBuf) {
+  const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const colRaw = await sharp(colorizedBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+
+  const oD = origRaw.data;
+  const cD = Buffer.from(colRaw.data); // mutable copy
+  const c = origRaw.info.channels;
+  const total = origRaw.info.width * origRaw.info.height;
+
+  for (let i = 0; i < total; i++) {
+    const p = i * c;
+    if (
+      oD[p] < DARK_THRESHOLD &&
+      oD[p + 1] < DARK_THRESHOLD &&
+      oD[p + 2] < DARK_THRESHOLD
+    ) {
+      cD[p] = 0;
+      cD[p + 1] = 0;
+      cD[p + 2] = 0;
+      cD[p + 3] = 255;
+    }
+  }
+
+  return sharp(cD, {
+    raw: { width: colRaw.info.width, height: colRaw.info.height, channels: c },
+  })
+    .png()
+    .toBuffer();
+}
+
 // Pick the best API size for a given aspect ratio.
 // API only supports: 1024x1024, 1024x1536 (portrait), 1536x1024 (landscape)
 function pickApiSize(w, h) {
@@ -313,6 +351,7 @@ async function colorizeSegment(segBuf, index, total) {
         action: "edit",
         input_fidelity: "high",
         size: apiSize,
+        output_format: "png",
       },
     ],
   });
@@ -342,7 +381,10 @@ async function colorizeSegment(segBuf, index, total) {
     .png()
     .toBuffer();
 
-  return cropped;
+  // Force any pixel that was black in the original back to pure black
+  const restored = await restoreBlacks(segBuf, cropped);
+
+  return restored;
 }
 
 // ── Step 5: Reassemble colorized segments ──────────────────────────────────
