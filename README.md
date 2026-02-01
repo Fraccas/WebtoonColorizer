@@ -1,6 +1,6 @@
 # WebtoonColorizer
 
-Automatic colorization of black-and-white webtoon panels using OpenAI's GPT-5.2 with smart panel detection.
+Automatic colorization of black-and-white webtoon panels using OpenAI's GPT-4.1 + gpt-image-1.5 with smart panel detection.
 
 ## The Problem
 
@@ -14,7 +14,7 @@ Instead of fighting the AI, WebtoonColorizer restructures the input so every chu
 
 1. **Stitch** — All input slices are joined into one continuous vertical strip.
 2. **Smart Split** — The strip is scanned for natural panel boundaries (horizontal bands of pure black pixels). These are safe cut points where no content bleeds across.
-3. **Colorize** — Each self-contained segment is sent to GPT-5.2, which sees complete panels with no ambiguity.
+3. **Colorize** — Each self-contained segment is sent to GPT-4.1 with the `image_generation` tool in **edit mode** with **high input fidelity**, preserving original line art and composition.
 4. **Reassemble** — Colorized segments are stitched back together.
 5. **Re-slice** — The reassembled strip is cut back to the original output dimensions.
 
@@ -25,6 +25,21 @@ The algorithm scans every horizontal row of the stitched image. A row is conside
 White text on black backgrounds (e.g., "WEEKS EARLIER...", "IT CAN'T END THIS WAY...") is automatically preserved because those text pixels are bright and fail the darkness check. The text stays inside its segment and is never split through.
 
 Splits happen at the midpoint of each safe band, ensuring clean cuts with no content on either side.
+
+### Aspect Ratio Handling
+
+The image generation API only supports three output sizes: 1024x1024, 1024x1536, and 1536x1024. Since detected segments can have arbitrary dimensions, the pipeline:
+
+1. Picks the closest API size based on the segment's aspect ratio
+2. Scales the segment to fit within those dimensions (preserving aspect ratio)
+3. Pads with black to fill the exact API size
+4. After colorization, crops out the padding and resizes back to original dimensions
+
+This ensures no content is cropped or distorted by the API.
+
+### Blank Segment Detection
+
+Segments that are 98%+ black pixels (divider bands, empty space) are automatically skipped — returned as-is without an API call. This saves API credits and prevents the AI from inventing content to fill empty space.
 
 ## Setup
 
@@ -64,6 +79,10 @@ All settings are optional. Add any of these to your `.env` file:
 | `EDGE_TOLERANCE` | `0.02` | Fraction of pixels per row allowed to be non-dark (handles compression artifacts) |
 | `DEBUG` | `false` | Set to `true` to save intermediate images to `./debug/` |
 
+### Character Colors
+
+Character descriptions are defined in the `PROMPT` constant in `colorizer.js`. Edit these to match your webtoon's characters for consistent colorization across panels.
+
 ### Output Dimensions
 
 Webtoon hosting platforms require specific slice dimensions. Common sizes:
@@ -94,8 +113,8 @@ $env:DEBUG="true"; node colorizer.js
 Intermediate files saved:
 
 - `01_stitched.png` — Full continuous strip
-- `02_segment_001_input.png` — Each segment before colorization
-- `03_segment_001_colorized.png` — Each segment after colorization
+- `02_segment_NNN_input.png` — Each segment before colorization
+- `03_segment_NNN_colorized.png` — Each segment after colorization
 - `04_reassembled.png` — Full colorized strip before re-slicing
 
 This is useful for tuning `DARK_THRESHOLD` and `MIN_GAP_HEIGHT` for your specific webtoon's art style.
@@ -115,7 +134,16 @@ Input Slices (800x1280 each)
     Split at midpoints of dark bands
         |
         v
-    Colorize each segment (GPT-5.2 Responses API + image_generation tool)
+    Skip blank segments (98%+ black)
+        |
+        v
+    Pad each segment to API-compatible size (1024x1024, 1024x1536, or 1536x1024)
+        |
+        v
+    Colorize via GPT-4.1 + image_generation tool (action: edit, input_fidelity: high)
+        |
+        v
+    Crop padding, restore original dimensions
         |
         v
     Reassemble into full strip
@@ -124,14 +152,14 @@ Input Slices (800x1280 each)
     Re-slice to 800x1280 output
 ```
 
-The colorization uses the OpenAI Responses API with GPT-5.2 and the `image_generation` tool — the same pipeline that powers ChatGPT's image generation. The model sees and understands each panel before generating the colorized version.
+The colorization uses the OpenAI Responses API with GPT-4.1 as the orchestrating model and gpt-image-1.5 (via the `image_generation` tool) for image editing. The `action: "edit"` parameter ensures the original art is preserved — only color is added. The `input_fidelity: "high"` parameter preserves fine details like faces, line art, and composition.
 
 ## Limitations
 
 - Requires clear black panel dividers for optimal splitting. Continuous scenes without any dark bands will be treated as a single segment.
-- Very tall segments (over 4000px) are automatically scaled down before sending to the API, then scaled back up. Minor quality loss is possible.
+- Segments are padded to fit API-supported aspect ratios (1:1, 2:3, 3:2). Very unusual aspect ratios will have more padding, but content is always preserved.
 - Colorization quality depends on the AI model. Some artistic interpretation is inherent.
-- API costs scale with the number of segments detected (not the number of input slices).
+- API costs scale with the number of non-blank segments detected (blank segments are skipped).
 
 ## Project Structure
 
