@@ -29,21 +29,21 @@ const MAX_SEGMENT_H = 4000;
 const MIN_SEGMENT_H = 100;
 
 const PROMPT = `
-Colorize this black-and-white webtoon/manga panel.
+Colorize this black-and-white webtoon/manga art.
 
-CRITICAL RULES:
-- Do not change the drawing in any way. Do not redraw or "complete" missing parts.
-- Do not change any outlines, screentones, or textures.
-- Do not move, resize, or warp any elements.
-- Do not add hair, heads, arms, or objects beyond what is already drawn.
-- Do not alter any text, speech bubbles, or SFX lettering.
-- The output must match the input panel in geometry and composition. ONLY add color.
-- Any area that is solid black in the input MUST remain solid black. Do not add color, gradients, or any tint to pure black backgrounds or divider sections.
+STRICT:
+- Preserve original line art, screentones, and composition exactly.
+- Do not change any text, bubbles, or SFX.
+- Do not add/remove objects or characters.
+- Any area that is solid black in the input MUST stay pure black (#000000). Do not tint, colorize, or lighten black panel dividers or black backgrounds.
 
-STYLE:
-- Clean vibrant webtoon/anime coloring with shading.
-- Preserve screentone texture; do not paint over it.
-- Keep blacks clean (avoid gray wash over line art).
+COLOR STYLE:
+- Modern Korean webtoon palette: clean, vibrant, high-chroma base colors.
+- No sepia / beige / vintage / parchment / "aged paper" look.
+- No global color grading or color cast.
+- Speech bubbles and highlights must remain neutral white (#FFFFFF); use them as white balance reference.
+- Shadows neutral-to-cool (slight blue/purple), not warm brown.
+- Increase saturation and contrast moderately.
 
 CHARACTERS:
 - Hiro (young male): light Korean complexion, black hair, white shirt, brown apron, blue pants.
@@ -305,7 +305,7 @@ async function colorizeSegment(segBuf, index, total) {
   ];
 
   const res = await client.responses.create({
-    model: "gpt-4.1",
+    model: "gpt-5.2",
     input: [{ role: "user", content }],
     tools: [
       {

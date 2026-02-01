@@ -1,6 +1,6 @@
 # WebtoonColorizer
 
-Automatic colorization of black-and-white webtoon panels using OpenAI's GPT-4.1 + gpt-image-1.5 with smart panel detection.
+Automatic colorization of black-and-white webtoon panels using OpenAI's GPT-5.2 + gpt-image-1.5 with smart panel detection.
 
 ## The Problem
 
@@ -14,7 +14,7 @@ Instead of fighting the AI, WebtoonColorizer restructures the input so every chu
 
 1. **Stitch** — All input slices are joined into one continuous vertical strip.
 2. **Smart Split** — The strip is scanned for natural panel boundaries (horizontal bands of pure black pixels). These are safe cut points where no content bleeds across.
-3. **Colorize** — Each self-contained segment is sent to GPT-4.1 with the `image_generation` tool in **edit mode** with **high input fidelity**, preserving original line art and composition.
+3. **Colorize** — Each self-contained segment is sent to GPT-5.2 with the `image_generation` tool in **edit mode** with **high input fidelity**, preserving original line art and composition.
 4. **Reassemble** — Colorized segments are stitched back together.
 5. **Re-slice** — The reassembled strip is cut back to the original output dimensions.
 
@@ -140,7 +140,7 @@ Input Slices (800x1280 each)
     Pad each segment to API-compatible size (1024x1024, 1024x1536, or 1536x1024)
         |
         v
-    Colorize via GPT-4.1 + image_generation tool (action: edit, input_fidelity: high)
+    Colorize via GPT-5.2 + image_generation tool (action: edit, input_fidelity: high)
         |
         v
     Crop padding, restore original dimensions
@@ -152,7 +152,20 @@ Input Slices (800x1280 each)
     Re-slice to 800x1280 output
 ```
 
-The colorization uses the OpenAI Responses API with GPT-4.1 as the orchestrating model and gpt-image-1.5 (via the `image_generation` tool) for image editing. The `action: "edit"` parameter ensures the original art is preserved — only color is added. The `input_fidelity: "high"` parameter preserves fine details like faces, line art, and composition.
+The colorization uses the OpenAI Responses API with GPT-5.2 as the orchestrating model and gpt-image-1.5 (via the `image_generation` tool) for image editing. The `action: "edit"` parameter ensures the original art is preserved — only color is added. The `input_fidelity: "high"` parameter preserves fine details like faces, line art, and composition.
+
+## Cost Estimates
+
+Cost is driven primarily by the image generation model (gpt-image-1.5), not the orchestrating text model. Blank segments (pure black dividers) are skipped and cost nothing.
+
+| Scale | Slices | Est. API Calls | Est. Cost |
+|---|---|---|---|
+| Test (3 slices) | 3 | ~3 | ~$0.65 |
+| Full chapter (100 slices) | 100 | ~60–80 | ~$13–$17 |
+
+**How the estimate works:** 3 input slices produced 5 segments, 2 were blank (skipped), so 3 API calls cost $0.65 (~$0.22/call). A 100-slice chapter will have more panels but also more black dividers. Assuming ~60–80 non-blank segments at ~$0.22 each gives the range above.
+
+Costs may vary based on segment size, API pricing changes, and how many blank segments your webtoon has.
 
 ## Limitations
 
