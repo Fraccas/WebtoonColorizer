@@ -38,16 +38,17 @@ CRITICAL RULES:
 - Do not add hair, heads, arms, or objects beyond what is already drawn.
 - Do not alter any text, speech bubbles, or SFX lettering.
 - The output must match the input panel in geometry and composition. ONLY add color.
+- Any area that is solid black in the input MUST remain solid black. Do not add color, gradients, or any tint to pure black backgrounds or divider sections.
 
 STYLE:
 - Clean vibrant webtoon/anime coloring with shading.
 - Preserve screentone texture; do not paint over it.
 - Keep blacks clean (avoid gray wash over line art).
 
-CONSISTENCY:
-- Main character: Korean; black hair.
-- Dad: Korean; black hair.
-- Keep clothing colors consistent across panels.
+CHARACTERS:
+- Hiro (young male): light Korean complexion, black hair, white shirt, brown apron, blue pants.
+- Old lady (Ms. Chan): gray hair, tan shirt, dark blue long skirt.
+- Keep these character colors consistent across all panels.
 `.trim();
 
 // ── Utility helpers ────────────────────────────────────────────────────────
