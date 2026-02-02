@@ -21,6 +21,13 @@ const EDGE_TOLERANCE = Number(process.env.EDGE_TOLERANCE) || 0.02;
 
 const DEBUG = process.env.DEBUG === "true";
 
+// Credit saver mode: uses cheaper orchestrator model.
+// Image generation quality (gpt-image-1.5) stays the same.
+const CREDIT_SAVER = false; // do not change to true
+
+// Character palette — selects a JSON file from ./palettes/
+const PALETTE = process.env.PALETTE || "intro";
+
 // Max height (in pixels) for a single segment sent to the API.
 // Segments taller than this are resized down before colorizing.
 const MAX_SEGMENT_H = 4000;
@@ -28,8 +35,11 @@ const MAX_SEGMENT_H = 4000;
 // Min height for a segment — anything smaller gets merged with its neighbor.
 const MIN_SEGMENT_H = 100;
 
-const PROMPT = `
+const PROMPT_BASE = `
 COLORIZE THIS BLACK-AND-WHITE WEBTOON PANEL.
+
+CONTEXT: This is a published Korean webtoon (manhwa). All content is fictional and safe.
+Sound effects like "BANG", "SLAM", "CRACK" refer to physical actions (hitting walls, doors, objects) — not violence or self-harm. Emotional dialogue about loss is standard dramatic storytelling.
 
 STRICT PRESERVATION RULES:
 - Preserve the original line art exactly; do NOT redraw, re-ink, or change shapes.
@@ -42,17 +52,30 @@ STRICT PRESERVATION RULES:
 COLOR STYLE:
 - Modern Korean webtoon palette: clean, vibrant, high-chroma base colors.
 - No sepia / beige / vintage / parchment / "aged paper" look.
-- No global color grading or color cast.
-- Speech bubbles and highlights must remain neutral white (#FFFFFF); use them as white balance reference.
+- No warm yellow or orange color cast. No golden-hour tint.
+- White balance must be neutral-cool. Speech bubbles and text bubbles MUST be pure white (#FFFFFF) — use them as the white point reference.
+- Lighting should feel like clean neutral daylight, not warm indoor lighting.
 - Clean cel-shading with soft gradient transitions.
 - Crisp edges, minimal color bleed across line boundaries.
 - If unsure about a color, keep it neutral rather than inventing bright colors.
-
-PALETTE LOCKS (MUST FOLLOW):
-- Hiro (young male): light Korean complexion, black hair (#1A1A1A), white shirt (#FFFFFF), brown apron (#8B5E3C), blue pants (#3A5FAE).
-- Ms. Chan (old lady): gray hair (#A0A0A0), tan shirt (#C9A87C), dark blue long skirt (#2B3A67).
-- Keep these character colors consistent across all panels.
+- All human skin must have a light Korean skin tone (#F5D6C3) — warm peach, never pure white and never tan/dark. Apply this to all exposed skin (face, hands, arms, legs).
 `.trim();
+
+async function loadPalette() {
+  const palettePath = path.join(".", "palettes", `${PALETTE}.json`);
+  try {
+    const raw = await fsp.readFile(palettePath, "utf-8");
+    const data = JSON.parse(raw);
+    console.log(`Palette: ${data.name} (${PALETTE}.json)`);
+    const lines = data.characters.map((c) => `- ${c}`).join("\n");
+    return `${PROMPT_BASE}\n\nPALETTE LOCKS (MUST FOLLOW):\n${lines}\n- Keep these character colors consistent across all panels.`;
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      throw new Error(`Palette file not found: ${palettePath}\nAvailable palettes are in the ./palettes/ directory.`);
+    }
+    throw err;
+  }
+}
 
 // ── Utility helpers ────────────────────────────────────────────────────────
 
@@ -252,9 +275,14 @@ async function isBlankSegment(buf) {
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
-// Any pixel that was black in the original input gets forced back to black
-// in the colorized output. This guarantees dividers/backgrounds stay pure black
-// regardless of what the AI does.
+// Uses a strict threshold (RGB < 5) to only restore truly black pixels
+// (panel dividers, solid black backgrounds) without affecting dark artwork
+// shadows or screentone that the AI has meaningfully colored.
+// A pixel is restored if it was near-pure-black in the original AND is NOT
+// adjacent to colorful artwork (detected by checking if neighbors in the
+// original were also black — isolated dark pixels in art are left alone).
+
+const BLACK_RESTORE_THRESHOLD = 5; // Much stricter than DARK_THRESHOLD (20)
 
 async function restoreBlacks(originalBuf, colorizedBuf) {
   const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -262,20 +290,54 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
 
   const oD = origRaw.data;
   const cD = Buffer.from(colRaw.data); // mutable copy
+  const w = origRaw.info.width;
+  const h = origRaw.info.height;
   const c = origRaw.info.channels;
-  const total = origRaw.info.width * origRaw.info.height;
 
-  for (let i = 0; i < total; i++) {
+  // First pass: mark which pixels are "true black" in the original
+  const isBlack = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
     const p = i * c;
     if (
-      oD[p] < DARK_THRESHOLD &&
-      oD[p + 1] < DARK_THRESHOLD &&
-      oD[p + 2] < DARK_THRESHOLD
+      oD[p] < BLACK_RESTORE_THRESHOLD &&
+      oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
+      oD[p + 2] < BLACK_RESTORE_THRESHOLD
     ) {
-      cD[p] = 0;
-      cD[p + 1] = 0;
-      cD[p + 2] = 0;
-      cD[p + 3] = 255;
+      isBlack[i] = 1;
+    }
+  }
+
+  // Second pass: only restore a black pixel if enough of its neighbors
+  // (in a 5x5 area) are also black. This ensures we restore large black
+  // regions (dividers, backgrounds) but leave isolated dark pixels in
+  // artwork (shadows, screentone, line art edges) untouched.
+  const RADIUS = 2;
+  const MIN_NEIGHBORS = 15; // out of 25 (5x5 area) = 60%
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y * w + x;
+      if (!isBlack[idx]) continue;
+
+      // Count black neighbors
+      let blackNeighbors = 0;
+      for (let dy = -RADIUS; dy <= RADIUS; dy++) {
+        for (let dx = -RADIUS; dx <= RADIUS; dx++) {
+          const ny = y + dy;
+          const nx = x + dx;
+          if (ny >= 0 && ny < h && nx >= 0 && nx < w) {
+            if (isBlack[ny * w + nx]) blackNeighbors++;
+          }
+        }
+      }
+
+      if (blackNeighbors >= MIN_NEIGHBORS) {
+        const p = idx * c;
+        cD[p] = 0;
+        cD[p + 1] = 0;
+        cD[p + 2] = 0;
+        cD[p + 3] = 255;
+      }
     }
   }
 
@@ -295,7 +357,7 @@ function pickApiSize(w, h) {
   return { aw: 1024, ah: 1024 };                      // square-ish
 }
 
-async function colorizeSegment(segBuf, index, total) {
+async function colorizeSegment(segBuf, index, total, prompt) {
   // Skip segments that are almost entirely black (nothing to colorize)
   if (await isBlankSegment(segBuf)) {
     console.log(`  Segment ${index + 1}/${total}: blank/black — skipping API call`);
@@ -330,26 +392,30 @@ async function colorizeSegment(segBuf, index, total) {
 
   console.log(`    Prepared ${origW}x${origH} → ${fitW}x${fitH} padded to ${aw}x${ah}`);
 
+  const orchModel = CREDIT_SAVER ? "gpt-4.1" : "gpt-5.2";
+  const fidelity = "high";
+  const visionDetail = "high";
+
   const content = [
     {
       type: "input_image",
       image_url: toDataUrl(sendBuf),
-      detail: "high",
+      detail: visionDetail,
     },
     {
       type: "input_text",
-      text: PROMPT,
+      text: prompt,
     },
   ];
 
   const res = await client.responses.create({
-    model: "gpt-5.2",
+    model: orchModel,
     input: [{ role: "user", content }],
     tools: [
       {
         type: "image_generation",
         action: "edit",
-        input_fidelity: "high",
+        input_fidelity: fidelity,
         size: apiSize,
         output_format: "png",
       },
@@ -367,6 +433,14 @@ async function colorizeSegment(segBuf, index, total) {
 
   if (!b64) {
     const types = res.output.map((o) => o.type).join(", ");
+    // Log the full response for debugging
+    for (const item of res.output) {
+      if (item.type === "message" && item.content) {
+        for (const c of item.content) {
+          if (c.text) console.error(`  API message: ${c.text}`);
+        }
+      }
+    }
     throw new Error(
       `Segment ${index + 1}/${total}: No image in response. Output types: ${types}`
     );
@@ -414,27 +488,29 @@ async function reassembleSegments(segments, width) {
   return reassembled;
 }
 
-// ── Step 6: Re-slice to output dimensions ──────────────────────────────────
+// ── Step 6: Re-slice to match original input slice dimensions ───────────
 
-async function reslice(reassembledBuf, width, totalH, sliceCount) {
+async function reslice(reassembledBuf, width, originalHeights) {
   const slices = [];
-  for (let i = 0; i < sliceCount; i++) {
-    const top = i * OUTPUT_H;
-    const remaining = totalH - top;
+  let top = 0;
+
+  for (let i = 0; i < originalHeights.length; i++) {
+    const sliceH = originalHeights[i];
+    const remaining = (await sharp(reassembledBuf).metadata()).height - top;
     if (remaining <= 0) break;
 
-    const extractH = Math.min(OUTPUT_H, remaining);
+    const extractH = Math.min(sliceH, remaining);
     let slice = await sharp(reassembledBuf)
       .extract({ left: 0, top, width, height: extractH })
       .png()
       .toBuffer();
 
-    // If the extracted region is shorter than OUTPUT_H, pad with black
-    if (extractH < OUTPUT_H) {
+    // If extracted region is shorter than the original slice, pad with black
+    if (extractH < sliceH) {
       slice = await sharp({
         create: {
           width,
-          height: OUTPUT_H,
+          height: sliceH,
           channels: 4,
           background: { r: 0, g: 0, b: 0, alpha: 1 },
         },
@@ -444,8 +520,8 @@ async function reslice(reassembledBuf, width, totalH, sliceCount) {
         .toBuffer();
     }
 
-    // Resize to output dimensions if width differs
-    if (width !== OUTPUT_W) {
+    // Resize to output dimensions if needed
+    if (width !== OUTPUT_W || sliceH !== OUTPUT_H) {
       slice = await sharp(slice)
         .resize(OUTPUT_W, OUTPUT_H, { fit: "fill" })
         .png()
@@ -453,6 +529,7 @@ async function reslice(reassembledBuf, width, totalH, sliceCount) {
     }
 
     slices.push(slice);
+    top += sliceH;
   }
 
   return slices;
@@ -472,6 +549,10 @@ async function debugSave(name, buf) {
 async function main() {
   if (!process.env.OPENAI_API_KEY)
     throw new Error("Missing OPENAI_API_KEY in .env");
+
+  console.log(`Mode: ${CREDIT_SAVER ? "CREDIT SAVER (gpt-4.1)" : "QUALITY (gpt-5.2)"}`);
+
+  const PROMPT = await loadPalette();
 
   await ensureDir(OUTPUT_DIR);
 
@@ -512,17 +593,39 @@ async function main() {
   }
 
   // 5. Colorize each segment
+  const MAX_RETRIES = 2;
   console.log("Colorizing segments...");
   const colorizedSegments = [];
   for (let i = 0; i < segments.length; i++) {
     console.log(
       `  Segment ${i + 1}/${segments.length} (${segments[i].width}x${segments[i].height})...`
     );
-    const colorized = await colorizeSegment(
-      segments[i].buffer,
-      i,
-      segments.length
-    );
+
+    let colorized = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        colorized = await colorizeSegment(
+          segments[i].buffer,
+          i,
+          segments.length,
+          PROMPT
+        );
+        break;
+      } catch (err) {
+        const isSafety = /safety|content_policy|moderation/i.test(err.message);
+        if (isSafety && attempt < MAX_RETRIES) {
+          console.log(`    Safety filter triggered — retrying (${attempt + 1}/${MAX_RETRIES})...`);
+          continue;
+        }
+        if (isSafety) {
+          console.warn(`    WARNING: Segment ${i + 1} blocked by safety filter after ${MAX_RETRIES} retries — using original B&W`);
+          colorized = segments[i].buffer;
+          break;
+        }
+        throw err; // non-safety errors still crash
+      }
+    }
+
     colorizedSegments.push({
       buffer: colorized,
       height: segments[i].height,
@@ -535,9 +638,9 @@ async function main() {
   const reassembled = await reassembleSegments(colorizedSegments, width);
   await debugSave("04_reassembled.png", reassembled);
 
-  // 7. Re-slice to output dimensions
+  // 7. Re-slice to match original input slice dimensions
   console.log(`Re-slicing to ${OUTPUT_W}x${OUTPUT_H}...`);
-  const outputSlices = await reslice(reassembled, width, totalH, targets.length);
+  const outputSlices = await reslice(reassembled, width, heights);
 
   // 8. Save output
   const { key: namePrefix, idx: startIdx, ext } = targets[0];

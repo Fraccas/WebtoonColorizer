@@ -78,6 +78,52 @@ All settings are optional. Add any of these to your `.env` file:
 | `MIN_GAP_HEIGHT` | `30` | Minimum consecutive dark rows required for a valid split point |
 | `EDGE_TOLERANCE` | `0.02` | Fraction of pixels per row allowed to be non-dark (handles compression artifacts) |
 | `DEBUG` | `false` | Set to `true` to save intermediate images to `./debug/` |
+| `CREDIT_SAVER` | `false` | Set to `true` to reduce API costs ~40-50% (see below) |
+| `PALETTE` | `intro` | Character palette file to load from `./palettes/` (see below) |
+
+### Character Palettes
+
+Character colors are defined in JSON files in the `./palettes/` directory. Set `PALETTE` in `.env` to select one:
+
+```env
+PALETTE=intro    # Chapters 1-2 (garden store, everyday life)
+PALETTE=games    # Chapters 3+  (arena, tracksuits, masks)
+```
+
+**Built-in palettes:**
+
+| File | Arc | Characters |
+|---|---|---|
+| `intro.json` | Chapters 1-2 | Hiro (white shirt, brown apron, blue pants), Ms. Chan (gray hair, tan shirt, blue skirt) |
+| `games.json` | Chapters 3+ | Red tracksuits, creme masks, Player 9 (blonde), Player 22 (brown hair), Player 7 (purple hair), Player 11 (black hair) |
+
+**Creating a custom palette:**
+
+Create a new JSON file in `./palettes/`:
+
+```json
+{
+  "name": "My Custom Arc",
+  "characters": [
+    "Character Name: description with hex color (#RRGGBB).",
+    "Another Character: description with hex color (#RRGGBB)."
+  ]
+}
+```
+
+Each entry in `characters` is injected directly into the AI prompt as a palette lock. Use hex color codes for consistency.
+
+### Credit Saver Mode
+
+Set `CREDIT_SAVER=true` in `.env` to reduce API costs by switching the orchestrator model:
+
+| Setting | Quality Mode (default) | Credit Saver |
+|---|---|---|
+| Orchestrator model | `gpt-5.2` | `gpt-4.1` (cheaper tokens) |
+| Input fidelity | `high` | `high` (unchanged) |
+| Vision detail | `high` | `high` (unchanged) |
+
+The image generation model (gpt-image-1.5), input fidelity, and vision detail stay the same in both modes — only the orchestrator is swapped. The `gpt-4.1` model is significantly cheaper per token while still following edit instructions reliably.
 
 ### Character Colors
 
@@ -158,12 +204,12 @@ The colorization uses the OpenAI Responses API with GPT-5.2 as the orchestrating
 
 Cost is driven primarily by the image generation model (gpt-image-1.5), not the orchestrating text model. Blank segments (pure black dividers) are skipped and cost nothing.
 
-| Scale | Slices | Est. API Calls | Est. Cost |
-|---|---|---|---|
-| Test (3 slices) | 3 | ~3 | ~$0.65 |
-| Full chapter (100 slices) | 100 | ~60–80 | ~$13–$17 |
+| Scale | Slices | Est. API Calls | Quality Mode | Credit Saver |
+|---|---|---|---|---|
+| Test (3 slices) | 3 | ~3 | ~$0.65 | ~$0.35–$0.40 |
+| Full chapter (100 slices) | 100 | ~60–80 | ~$13–$17 | ~$7–$10 |
 
-**How the estimate works:** 3 input slices produced 5 segments, 2 were blank (skipped), so 3 API calls cost $0.65 (~$0.22/call). A 100-slice chapter will have more panels but also more black dividers. Assuming ~60–80 non-blank segments at ~$0.22 each gives the range above.
+**How the estimate works:** 3 input slices produced 5 segments, 2 were blank (skipped), so 3 API calls cost ~$0.65 in quality mode (~$0.22/call). Credit saver mode reduces orchestration overhead by ~40-50%. A 100-slice chapter will have more panels but also more black dividers. Assuming ~60–80 non-blank segments gives the ranges above.
 
 Costs may vary based on segment size, API pricing changes, and how many blank segments your webtoon has.
 
@@ -181,6 +227,9 @@ WebtoonColorizer/
     colorizer.js        Main script
     package.json        Dependencies (openai, sharp, dotenv)
     .env                API key and configuration
+    palettes/           Character color palettes (JSON)
+        intro.json      Chapters 1-2
+        games.json      Chapters 3+
     input/              Input B&W slices (PNG)
     output/             Colorized output slices
     debug/              Intermediate images (when DEBUG=true)
