@@ -58,7 +58,7 @@ This saves API credits and prevents the AI from inventing content to fill empty 
    OPENAI_API_KEY=sk-...
    ```
 
-3. Place your black-and-white webtoon slices (PNG) in `./input/`.
+3. Place your black-and-white webtoon slices (PNG or JPG) in `./input/`.
 
 ## Usage
 
@@ -178,10 +178,10 @@ This is useful for tuning `DARK_THRESHOLD` and `MIN_GAP_HEIGHT` for your specifi
 ## How It Works (Technical)
 
 ```
-Input Slices (800x1280 each)
+Input Slices (PNG or JPG)
         |
         v
-    Stitch vertically (800 x N*1280)
+    Stitch vertically into one continuous strip
         |
         v
     Scan rows for dark bands (split detection)
@@ -193,22 +193,30 @@ Input Slices (800x1280 each)
     Skip blank segments (98%+ black or text-on-black)
         |
         v
-    Pad each segment to API-compatible size (1024x1024, 1024x1536, or 1536x1024)
+    Downscale to quality tier max width (medium: 1024px, low: 800px)
         |
         v
-    Colorize via GPT-5.2 + image_generation tool (action: edit, input_fidelity: high)
+    Pad to API-compatible size (1024x1024, 1024x1536, or 1536x1024)
         |
         v
-    Crop padding, restore original dimensions
+    Colorize via GPT-5.2 + gpt-image-1.5 (action: edit, input_fidelity: high)
+        |
+        v
+    Crop padding, restore blacks (flood fill connected components)
+        |
+        v
+    Upscale back to original dimensions
         |
         v
     Reassemble into full strip
         |
         v
-    Re-slice to 800x1280 output
+    Re-slice to output dimensions (PNG or JPG matching input format)
 ```
 
 The colorization uses the OpenAI Responses API with GPT-5.2 as the orchestrating model and gpt-image-1.5 (via the `image_generation` tool) for image editing. The `action: "edit"` parameter ensures the original art is preserved — only color is added. The `input_fidelity: "high"` parameter preserves fine details like faces, line art, and composition.
+
+**Black restoration:** After colorization, a connected component flood fill identifies large contiguous black regions (500+ pixels) in the original and forces them back to pure black. This prevents panel dividers and black backgrounds from picking up color tints, while leaving small dark elements in artwork (shadows, screentone, line art) untouched.
 
 ## Cost Estimates
 
@@ -228,6 +236,7 @@ Costs may vary based on segment size, API pricing changes, and how many blank se
 - Requires clear black panel dividers for optimal splitting. Continuous scenes without any dark bands will be treated as a single segment.
 - Segments are padded to fit API-supported aspect ratios (1:1, 2:3, 3:2). Very unusual aspect ratios will have more padding, but content is always preserved.
 - Colorization quality depends on the AI model. Some artistic interpretation is inherent.
+- Small text (e.g., timestamps like "4:58PM") may be distorted by the AI during colorization, especially at lower quality tiers.
 - API costs scale with the number of non-blank segments detected (blank segments are skipped).
 
 ## Project Structure
