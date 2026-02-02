@@ -39,7 +39,12 @@ This ensures no content is cropped or distorted by the API.
 
 ### Blank Segment Detection
 
-Segments that are 98%+ black pixels (divider bands, empty space) are automatically skipped — returned as-is without an API call. This saves API credits and prevents the AI from inventing content to fill empty space.
+Segments are automatically skipped (returned as-is without an API call) when they match either pattern:
+
+- **Pure black** — 98%+ dark pixels (divider bands, empty space)
+- **Text-on-black** — 85%+ dark pixels where the non-dark pixels are predominantly white (e.g., "WEEKS EARLIER...", "ALONE..."). These caption segments have no artwork to colorize.
+
+This saves API credits and prevents the AI from inventing content to fill empty space.
 
 ## Setup
 
@@ -78,7 +83,7 @@ All settings are optional. Add any of these to your `.env` file:
 | `MIN_GAP_HEIGHT` | `30` | Minimum consecutive dark rows required for a valid split point |
 | `EDGE_TOLERANCE` | `0.02` | Fraction of pixels per row allowed to be non-dark (handles compression artifacts) |
 | `DEBUG` | `false` | Set to `true` to save intermediate images to `./debug/` |
-| `CREDIT_SAVER` | `false` | Set to `true` to reduce API costs ~40-50% (see below) |
+| `QUALITY` | `medium` | Image generation quality: `low`, `medium`, or `high` (see below) |
 | `PALETTE` | `intro` | Character palette file to load from `./palettes/` (see below) |
 
 ### Character Palettes
@@ -113,21 +118,22 @@ Create a new JSON file in `./palettes/`:
 
 Each entry in `characters` is injected directly into the AI prompt as a palette lock. Use hex color codes for consistency.
 
-### Credit Saver Mode
+### Quality Tiers
 
-Set `CREDIT_SAVER=true` in `.env` to reduce API costs by switching the orchestrator model:
+The `QUALITY` setting controls the input resolution sent to the API. The model, input fidelity, and all other settings stay at their best values — only pixel count changes:
 
-| Setting | Quality Mode (default) | Credit Saver |
-|---|---|---|
-| Orchestrator model | `gpt-5.2` | `gpt-4.1` (cheaper tokens) |
-| Input fidelity | `high` | `high` (unchanged) |
-| Vision detail | `high` | `high` (unchanged) |
+| Setting | `high` | `medium` (default) | `low` |
+|---|---|---|---|
+| Max input width | full resolution | 1024px | 640px |
+| API output size | up to 1536x1024 | up to 1024x1536 | 1024x1024 |
 
-The image generation model (gpt-image-1.5), input fidelity, and vision detail stay the same in both modes — only the orchestrator is swapped. The `gpt-4.1` model is significantly cheaper per token while still following edit instructions reliably.
+**How it saves money:** Lower tiers downscale the input before sending it to the API, which means smaller API output sizes, fewer orchestrator vision tokens, and cheaper image generation. The colorized output is always upscaled back to the original dimensions.
 
-### Character Colors
-
-Character descriptions are defined in the `PROMPT` constant in `colorizer.js`. Edit these to match your webtoon's characters for consistent colorization across panels.
+```env
+QUALITY=medium   # Good balance of quality and cost (default)
+QUALITY=high     # Best quality for final output
+QUALITY=low      # Cheapest — good for previews and iteration
+```
 
 ### Output Dimensions
 
@@ -180,7 +186,7 @@ Input Slices (800x1280 each)
     Split at midpoints of dark bands
         |
         v
-    Skip blank segments (98%+ black)
+    Skip blank segments (98%+ black or text-on-black)
         |
         v
     Pad each segment to API-compatible size (1024x1024, 1024x1536, or 1536x1024)
@@ -202,14 +208,14 @@ The colorization uses the OpenAI Responses API with GPT-5.2 as the orchestrating
 
 ## Cost Estimates
 
-Cost is driven primarily by the image generation model (gpt-image-1.5), not the orchestrating text model. Blank segments (pure black dividers) are skipped and cost nothing.
+Cost is driven primarily by the image generation quality tier, not the orchestrating text model. Blank and text-on-black segments are skipped and cost nothing.
 
-| Scale | Slices | Est. API Calls | Quality Mode | Credit Saver |
-|---|---|---|---|---|
-| Test (3 slices) | 3 | ~3 | ~$0.65 | ~$0.35–$0.40 |
-| Full chapter (100 slices) | 100 | ~60–80 | ~$13–$17 | ~$7–$10 |
+| Scale | Slices | Est. API Calls | High | Medium | Low |
+|---|---|---|---|---|---|
+| Test (3 slices) | 3 | ~3 | ~$0.60 | ~$0.15 | ~$0.04 |
+| Full chapter (100 slices) | 100 | ~60–80 | ~$12–$16 | ~$3–$4 | ~$0.80–$1 |
 
-**How the estimate works:** 3 input slices produced 5 segments, 2 were blank (skipped), so 3 API calls cost ~$0.65 in quality mode (~$0.22/call). Credit saver mode reduces orchestration overhead by ~40-50%. A 100-slice chapter will have more panels but also more black dividers. Assuming ~60–80 non-blank segments gives the ranges above.
+**How the estimate works:** A typical 3-slice test produces ~5 segments, of which ~2 are blank (skipped), leaving ~3 API calls. A 100-slice chapter has more panels but also more black dividers and text-on-black captions — assuming ~60–80 non-blank segments gives the ranges above.
 
 Costs may vary based on segment size, API pricing changes, and how many blank segments your webtoon has.
 

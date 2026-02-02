@@ -21,9 +21,18 @@ const EDGE_TOLERANCE = Number(process.env.EDGE_TOLERANCE) || 0.02;
 
 const DEBUG = process.env.DEBUG === "true";
 
-// Credit saver mode: uses cheaper orchestrator model.
-// Image generation quality (gpt-image-1.5) stays the same.
-const CREDIT_SAVER = false; // do not change to true
+// Image generation quality tier: "low", "medium", or "high".
+// Controls image gen quality, input resolution, and vision detail.
+const QUALITY = (process.env.QUALITY || "medium").toLowerCase();
+
+// Quality-tier settings: only maxWidth changes between tiers.
+// Model, fidelity, and vision detail stay at their best values always.
+const QUALITY_TIERS = {
+  high: { maxWidth: Infinity },
+  medium: { maxWidth: 1024 },
+  low: { maxWidth: 640 },
+};
+const TIER = QUALITY_TIERS[QUALITY] || QUALITY_TIERS.medium;
 
 // Character palette — selects a JSON file from ./palettes/
 const PALETTE = process.env.PALETTE || "intro";
@@ -265,17 +274,33 @@ async function isBlankSegment(buf) {
 
   const total = info.width * info.height;
   let darkCount = 0;
+  let brightCount = 0;
   for (let i = 0; i < total; i++) {
     const p = i * info.channels;
-    if (
-      data[p] < DARK_THRESHOLD &&
-      data[p + 1] < DARK_THRESHOLD &&
-      data[p + 2] < DARK_THRESHOLD
-    ) {
+    const r = data[p], g = data[p + 1], b = data[p + 2];
+    if (r < DARK_THRESHOLD && g < DARK_THRESHOLD && b < DARK_THRESHOLD) {
       darkCount++;
+    } else if (r > 200 && g > 200 && b > 200) {
+      brightCount++;
     }
   }
-  return darkCount / total >= 0.98;
+
+  const darkRatio = darkCount / total;
+  const nonDark = total - darkCount;
+  const brightRatio = nonDark > 0 ? brightCount / nonDark : 0;
+
+  // Pure black segments (dividers, empty space) — 98%+ dark
+  if (darkRatio >= 0.98) return `blank (${(darkRatio * 100).toFixed(0)}% black)`;
+
+  // Text-on-black segments (e.g., "WEEKS EARLIER...", "ALONE...") —
+  // mostly black with small amounts of white text. No artwork to colorize.
+  // Must be 85%+ dark, and non-dark pixels are mostly white text.
+  // Threshold is 0.6 (not higher) to account for anti-aliased text edges.
+  if (darkRatio >= 0.85 && nonDark > 0 && brightRatio >= 0.6) {
+    return `text-on-black (${(darkRatio * 100).toFixed(0)}% black, ${(brightRatio * 100).toFixed(0)}% of rest is white)`;
+  }
+
+  return false;
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
@@ -354,35 +379,64 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
 
 // Pick the best API size for a given aspect ratio.
 // API only supports: 1024x1024, 1024x1536 (portrait), 1536x1024 (landscape)
+// Picks the smallest API size that fits the aspect ratio without excessive upscaling.
 function pickApiSize(w, h) {
   const ratio = w / h;
-  if (ratio > 1.2) return { aw: 1536, ah: 1024 };   // landscape
-  if (ratio < 0.8) return { aw: 1024, ah: 1536 };   // portrait
-  return { aw: 1024, ah: 1024 };                      // square-ish
+  const candidates = [
+    { aw: 1024, ah: 1024 },   // square
+    { aw: 1024, ah: 1536 },   // portrait
+    { aw: 1536, ah: 1024 },   // landscape
+  ];
+
+  // Score each candidate: prefer the one where the scale factor is closest to 1
+  // (i.e., least upscaling needed) while still fitting the aspect ratio reasonably.
+  let best = candidates[0];
+  let bestScore = Infinity;
+  for (const c of candidates) {
+    const scale = Math.min(c.aw / w, c.ah / h);
+    const aspectDiff = Math.abs(c.aw / c.ah - ratio);
+    // Penalize heavy upscaling (scale > 2) — prefer smaller API size
+    const upscalePenalty = scale > 2 ? scale : 0;
+    const score = aspectDiff + upscalePenalty;
+    if (score < bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+
+  return best;
 }
 
 async function colorizeSegment(segBuf, index, total, prompt) {
-  // Skip segments that are almost entirely black (nothing to colorize)
-  if (await isBlankSegment(segBuf)) {
-    console.log(`  Segment ${index + 1}/${total}: blank/black — skipping API call`);
-    return segBuf;
-  }
-
   const meta = await sharp(segBuf).metadata();
   const origW = meta.width;
   const origH = meta.height;
 
-  // Choose the API output size that best matches this segment's aspect ratio
-  const { aw, ah } = pickApiSize(origW, origH);
+  // Downscale segment if wider than the quality tier allows.
+  // This reduces both vision tokens (orchestrator) and image gen cost.
+  let workBuf = segBuf;
+  let workW = origW;
+  let workH = origH;
+  if (origW > TIER.maxWidth) {
+    const downscale = TIER.maxWidth / origW;
+    workW = TIER.maxWidth;
+    workH = Math.round(origH * downscale);
+    workBuf = await sharp(segBuf)
+      .resize(workW, workH, { fit: "fill" })
+      .png()
+      .toBuffer();
+  }
+
+  // Choose the API output size that best matches the working aspect ratio
+  const { aw, ah } = pickApiSize(workW, workH);
   const apiSize = `${aw}x${ah}`;
 
-  // Resize segment to fit within the API dimensions while preserving aspect ratio,
-  // then pad with black to exactly match the API size.
-  const scale = Math.min(aw / origW, ah / origH);
-  const fitW = Math.round(origW * scale);
-  const fitH = Math.round(origH * scale);
+  // Resize to fit within the API dimensions, then pad with black.
+  const scale = Math.min(aw / workW, ah / workH);
+  const fitW = Math.round(workW * scale);
+  const fitH = Math.round(workH * scale);
 
-  const sendBuf = await sharp(segBuf)
+  const sendBuf = await sharp(workBuf)
     .resize(fitW, fitH, { fit: "fill" })
     .extend({
       top: 0,
@@ -394,17 +448,13 @@ async function colorizeSegment(segBuf, index, total, prompt) {
     .png()
     .toBuffer();
 
-  console.log(`    Prepared ${origW}x${origH} → ${fitW}x${fitH} padded to ${aw}x${ah}`);
-
-  const orchModel = CREDIT_SAVER ? "gpt-4.1" : "gpt-5.2";
-  const fidelity = "high";
-  const visionDetail = "high";
+  console.log(`    Prepared ${origW}x${origH} → ${workW}x${workH} → ${fitW}x${fitH} padded to ${aw}x${ah}`);
 
   const content = [
     {
       type: "input_image",
       image_url: toDataUrl(sendBuf),
-      detail: visionDetail,
+      detail: "low",
     },
     {
       type: "input_text",
@@ -413,14 +463,15 @@ async function colorizeSegment(segBuf, index, total, prompt) {
   ];
 
   const res = await client.responses.create({
-    model: orchModel,
+    model: "gpt-5.2",
     instructions: SYSTEM_INSTRUCTIONS,
     input: [{ role: "user", content }],
     tools: [
       {
         type: "image_generation",
         action: "edit",
-        input_fidelity: fidelity,
+        quality: QUALITY,
+        input_fidelity: "high",
         size: apiSize,
         output_format: "png",
       },
@@ -438,7 +489,6 @@ async function colorizeSegment(segBuf, index, total, prompt) {
 
   if (!b64) {
     const types = res.output.map((o) => o.type).join(", ");
-    // Log the full response for debugging
     for (const item of res.output) {
       if (item.type === "message" && item.content) {
         for (const c of item.content) {
@@ -453,7 +503,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
 
   const apiOut = Buffer.from(b64, "base64");
 
-  // Crop out the padding, then resize back to exact original dimensions
+  // Crop out the padding, then resize back to original full-res dimensions
   const cropped = await sharp(apiOut)
     .extract({ left: 0, top: 0, width: fitW, height: fitH })
     .resize(origW, origH, { fit: "fill" })
@@ -555,7 +605,7 @@ async function main() {
   if (!process.env.OPENAI_API_KEY)
     throw new Error("Missing OPENAI_API_KEY in .env");
 
-  console.log(`Mode: ${CREDIT_SAVER ? "CREDIT SAVER (gpt-4.1)" : "QUALITY (gpt-5.2)"}`);
+  console.log(`Quality: ${QUALITY} | Model: gpt-5.2`);
 
   const PROMPT = await loadPalette();
 
@@ -599,6 +649,8 @@ async function main() {
 
   // 5. Colorize each segment
   const MAX_RETRIES = 2;
+  let apiCalls = 0;
+  let skippedSegments = 0;
   console.log("Colorizing segments...");
   const colorizedSegments = [];
   for (let i = 0; i < segments.length; i++) {
@@ -606,28 +658,39 @@ async function main() {
       `  Segment ${i + 1}/${segments.length} (${segments[i].width}x${segments[i].height})...`
     );
 
+    // Check if segment is blank/text-on-black before making API call
+    const blankReason = await isBlankSegment(segments[i].buffer);
     let colorized = null;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        colorized = await colorizeSegment(
-          segments[i].buffer,
-          i,
-          segments.length,
-          PROMPT
-        );
-        break;
-      } catch (err) {
-        const isSafety = /safety|content_policy|moderation/i.test(err.message);
-        if (isSafety && attempt < MAX_RETRIES) {
-          console.log(`    Safety filter triggered — retrying (${attempt + 1}/${MAX_RETRIES})...`);
-          continue;
-        }
-        if (isSafety) {
-          console.warn(`    WARNING: Segment ${i + 1} blocked by safety filter after ${MAX_RETRIES} retries — using original B&W`);
-          colorized = segments[i].buffer;
+
+    if (blankReason) {
+      console.log(`    ${blankReason} — skipping API call`);
+      colorized = segments[i].buffer;
+      skippedSegments++;
+    } else {
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          colorized = await colorizeSegment(
+            segments[i].buffer,
+            i,
+            segments.length,
+            PROMPT
+          );
+          apiCalls++;
           break;
+        } catch (err) {
+          const isSafety = /safety|content_policy|moderation/i.test(err.message);
+          if (isSafety && attempt < MAX_RETRIES) {
+            console.log(`    Safety filter triggered — retrying (${attempt + 1}/${MAX_RETRIES})...`);
+            apiCalls++; // retry still costs
+            continue;
+          }
+          if (isSafety) {
+            console.warn(`    WARNING: Segment ${i + 1} blocked by safety filter after ${MAX_RETRIES} retries — using original B&W`);
+            colorized = segments[i].buffer;
+            break;
+          }
+          throw err; // non-safety errors still crash
         }
-        throw err; // non-safety errors still crash
       }
     }
 
@@ -637,6 +700,8 @@ async function main() {
     });
     await debugSave(`03_segment_${pad(i + 1)}_colorized.png`, colorized);
   }
+
+  console.log(`\nAPI summary: ${apiCalls} calls, ${skippedSegments} skipped (quality: ${QUALITY})`);
 
   // 6. Reassemble
   console.log("Reassembling...");
