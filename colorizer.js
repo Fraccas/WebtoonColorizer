@@ -304,14 +304,14 @@ async function isBlankSegment(buf) {
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
-// Uses a strict threshold (RGB < 5) to only restore truly black pixels
-// (panel dividers, solid black backgrounds) without affecting dark artwork
-// shadows or screentone that the AI has meaningfully colored.
-// A pixel is restored if it was near-pure-black in the original AND is NOT
-// adjacent to colorful artwork (detected by checking if neighbors in the
-// original were also black — isolated dark pixels in art are left alone).
+// Uses connected component analysis (flood fill) to find large contiguous
+// black regions in the original (panel dividers, solid black backgrounds)
+// and forces those pixels back to pure black in the colorized output.
+// Small black clusters (line art edges, screentone, shadows near artwork)
+// are left alone since they belong to the art, not to structural elements.
 
-const BLACK_RESTORE_THRESHOLD = 5; // Much stricter than DARK_THRESHOLD (20)
+const BLACK_RESTORE_THRESHOLD = 5; // RGB < 5 = "true black"
+const MIN_COMPONENT_SIZE = 500;    // minimum pixels for a region to be restored
 
 async function restoreBlacks(originalBuf, colorizedBuf) {
   const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -321,12 +321,12 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
   const cD = Buffer.from(colRaw.data); // mutable copy
   const w = origRaw.info.width;
   const h = origRaw.info.height;
-  const c = origRaw.info.channels;
+  const ch = origRaw.info.channels;
 
-  // First pass: mark which pixels are "true black" in the original
+  // Pass 1: mark which pixels are "true black" in the original
   const isBlack = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) {
-    const p = i * c;
+    const p = i * ch;
     if (
       oD[p] < BLACK_RESTORE_THRESHOLD &&
       oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
@@ -336,42 +336,60 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
     }
   }
 
-  // Second pass: only restore a black pixel if enough of its neighbors
-  // (in a 5x5 area) are also black. This ensures we restore large black
-  // regions (dividers, backgrounds) but leave isolated dark pixels in
-  // artwork (shadows, screentone, line art edges) untouched.
-  const RADIUS = 2;
-  const MIN_NEIGHBORS = 15; // out of 25 (5x5 area) = 60%
+  // Pass 2: find connected components via flood fill
+  // Each pixel gets a component label (0 = not black / unvisited)
+  const label = new Int32Array(w * h); // 0 = unlabeled
+  const componentSizes = [0]; // index 0 unused; component IDs start at 1
+  let nextLabel = 1;
 
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const idx = y * w + x;
-      if (!isBlack[idx]) continue;
+  for (let i = 0; i < w * h; i++) {
+    if (!isBlack[i] || label[i]) continue;
 
-      // Count black neighbors
-      let blackNeighbors = 0;
-      for (let dy = -RADIUS; dy <= RADIUS; dy++) {
-        for (let dx = -RADIUS; dx <= RADIUS; dx++) {
-          const ny = y + dy;
-          const nx = x + dx;
-          if (ny >= 0 && ny < h && nx >= 0 && nx < w) {
-            if (isBlack[ny * w + nx]) blackNeighbors++;
-          }
+    // BFS flood fill for this component
+    const componentId = nextLabel++;
+    const queue = [i];
+    let size = 0;
+    label[i] = componentId;
+
+    while (queue.length > 0) {
+      const idx = queue.pop();
+      size++;
+      const x = idx % w;
+      const y = (idx - x) / w;
+
+      // 4-connected neighbors (up, down, left, right)
+      const neighbors = [];
+      if (y > 0) neighbors.push(idx - w);
+      if (y < h - 1) neighbors.push(idx + w);
+      if (x > 0) neighbors.push(idx - 1);
+      if (x < w - 1) neighbors.push(idx + 1);
+
+      for (const ni of neighbors) {
+        if (isBlack[ni] && !label[ni]) {
+          label[ni] = componentId;
+          queue.push(ni);
         }
       }
+    }
 
-      if (blackNeighbors >= MIN_NEIGHBORS) {
-        const p = idx * c;
-        cD[p] = 0;
-        cD[p + 1] = 0;
-        cD[p + 2] = 0;
-        cD[p + 3] = 255;
-      }
+    componentSizes.push(size);
+  }
+
+  // Pass 3: restore only pixels belonging to large components
+  let restored = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (label[i] && componentSizes[label[i]] >= MIN_COMPONENT_SIZE) {
+      const p = i * ch;
+      cD[p] = 0;
+      cD[p + 1] = 0;
+      cD[p + 2] = 0;
+      cD[p + 3] = 255;
+      restored++;
     }
   }
 
   return sharp(cD, {
-    raw: { width: colRaw.info.width, height: colRaw.info.height, channels: c },
+    raw: { width: colRaw.info.width, height: colRaw.info.height, channels: ch },
   })
     .png()
     .toBuffer();
