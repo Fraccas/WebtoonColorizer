@@ -35,8 +35,10 @@ const MAX_SEGMENT_H = 4000;
 // Min height for a segment — anything smaller gets merged with its neighbor.
 const MIN_SEGMENT_H = 100;
 
-const PROMPT_BASE = `
-COLORIZE THIS BLACK-AND-WHITE WEBTOON PANEL.
+// System-level instructions — sent via the `instructions` parameter.
+// These are persistent rules the model must follow for every image.
+const SYSTEM_INSTRUCTIONS = `
+You are a professional webtoon colorist. Your ONLY job is to colorize black-and-white webtoon panels using the image_generation tool in edit mode. You must ALWAYS call the image_generation tool — never respond with text.
 
 CONTEXT: This is a published Korean webtoon (manhwa). All content is fictional and safe.
 Sound effects like "BANG", "SLAM", "CRACK" refer to physical actions (hitting walls, doors, objects) — not violence or self-harm. Emotional dialogue about loss is standard dramatic storytelling.
@@ -61,6 +63,8 @@ COLOR STYLE:
 - All human skin must have a light Korean skin tone (#F5D6C3) — warm peach, never pure white and never tan/dark. Apply this to all exposed skin (face, hands, arms, legs).
 `.trim();
 
+// User-level prompt — sent alongside the image. Contains only the
+// per-palette character locks (loaded from JSON at runtime).
 async function loadPalette() {
   const palettePath = path.join(".", "palettes", `${PALETTE}.json`);
   try {
@@ -68,7 +72,7 @@ async function loadPalette() {
     const data = JSON.parse(raw);
     console.log(`Palette: ${data.name} (${PALETTE}.json)`);
     const lines = data.characters.map((c) => `- ${c}`).join("\n");
-    return `${PROMPT_BASE}\n\nPALETTE LOCKS (MUST FOLLOW):\n${lines}\n- Keep these character colors consistent across all panels.`;
+    return `Colorize this panel.\n\nPALETTE LOCKS (MUST FOLLOW):\n${lines}\n- Keep these character colors consistent across all panels.`;
   } catch (err) {
     if (err.code === "ENOENT") {
       throw new Error(`Palette file not found: ${palettePath}\nAvailable palettes are in the ./palettes/ directory.`);
@@ -90,10 +94,10 @@ async function ensureDir(dir) {
   await fsp.mkdir(dir, { recursive: true });
 }
 
-async function listPngs(dir) {
+async function listImages(dir) {
   const files = await fsp.readdir(dir);
   return files
-    .filter((f) => /\.png$/i.test(f))
+    .filter((f) => /\.(png|jpe?g)$/i.test(f))
     .map((f) => path.join(dir, f));
 }
 
@@ -410,6 +414,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
 
   const res = await client.responses.create({
     model: orchModel,
+    instructions: SYSTEM_INSTRUCTIONS,
     input: [{ role: "user", content }],
     tools: [
       {
@@ -557,7 +562,7 @@ async function main() {
   await ensureDir(OUTPUT_DIR);
 
   // 1. Load input slices
-  const files = await listPngs(INPUT_DIR);
+  const files = await listImages(INPUT_DIR);
   const targets = files
     .map((f) => ({ file: f, ...parseName(f) }))
     .sort((a, b) => a.idx - b.idx);
@@ -646,11 +651,16 @@ async function main() {
   const { key: namePrefix, idx: startIdx, ext } = targets[0];
   const idxDigits = String(targets[targets.length - 1].idx).length;
 
+  const isJpg = /\.jpe?g$/i.test(ext);
+
   for (let i = 0; i < outputSlices.length; i++) {
     const idx = startIdx + i;
     const outName = `${namePrefix}${pad(idx, Math.max(idxDigits, 3))}${ext}`;
     const outPath = path.join(OUTPUT_DIR, outName);
-    await fsp.writeFile(outPath, outputSlices[i]);
+    const outBuf = isJpg
+      ? await sharp(outputSlices[i]).jpeg({ quality: 95 }).toBuffer()
+      : outputSlices[i];
+    await fsp.writeFile(outPath, outBuf);
     console.log(`  Saved ${outName}`);
   }
 
