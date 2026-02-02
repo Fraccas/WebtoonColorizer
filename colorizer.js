@@ -70,6 +70,7 @@ COLOR STYLE:
 - Crisp edges, minimal color bleed across line boundaries.
 - If unsure about a color, keep it neutral rather than inventing bright colors.
 - All human skin must have a light Korean skin tone (#F5D6C3) — warm peach, never pure white and never tan/dark. Apply this to all exposed skin (face, hands, arms, legs).
+- Eye whites (sclera) must be pure white (#FFFFFF), not skin-colored or tinted.
 `.trim();
 
 // User-level prompt — sent alongside the image. Contains only the
@@ -304,14 +305,15 @@ async function isBlankSegment(buf) {
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
-// Uses connected component analysis (flood fill) to find large contiguous
-// black regions in the original (panel dividers, solid black backgrounds)
-// and forces those pixels back to pure black in the colorized output.
-// Small black clusters (line art edges, screentone, shadows near artwork)
-// are left alone since they belong to the art, not to structural elements.
+// Uses row-density analysis to identify structural black regions (panel
+// dividers, black backgrounds) and forces them back to pure black.
+// Only restores pixels in rows where 90%+ of pixels are dark — these are
+// structural rows (dividers, full-width black bands), not artwork rows.
+// Artwork rows with characters, shadows, line art, etc. are never touched,
+// even if they contain black pixels, because they never reach 90% density.
 
 const BLACK_RESTORE_THRESHOLD = 5; // RGB < 5 = "true black"
-const MIN_COMPONENT_SIZE = 500;    // minimum pixels for a region to be restored
+const ROW_DARK_RATIO = 0.90;       // row must be 90%+ dark to be restorable
 
 async function restoreBlacks(originalBuf, colorizedBuf) {
   const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -323,68 +325,39 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
   const h = origRaw.info.height;
   const ch = origRaw.info.channels;
 
-  // Pass 1: mark which pixels are "true black" in the original
-  const isBlack = new Uint8Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const p = i * ch;
-    if (
-      oD[p] < BLACK_RESTORE_THRESHOLD &&
-      oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
-      oD[p + 2] < BLACK_RESTORE_THRESHOLD
-    ) {
-      isBlack[i] = 1;
-    }
-  }
-
-  // Pass 2: find connected components via flood fill
-  // Each pixel gets a component label (0 = not black / unvisited)
-  const label = new Int32Array(w * h); // 0 = unlabeled
-  const componentSizes = [0]; // index 0 unused; component IDs start at 1
-  let nextLabel = 1;
-
-  for (let i = 0; i < w * h; i++) {
-    if (!isBlack[i] || label[i]) continue;
-
-    // BFS flood fill for this component
-    const componentId = nextLabel++;
-    const queue = [i];
-    let size = 0;
-    label[i] = componentId;
-
-    while (queue.length > 0) {
-      const idx = queue.pop();
-      size++;
-      const x = idx % w;
-      const y = (idx - x) / w;
-
-      // 4-connected neighbors (up, down, left, right)
-      const neighbors = [];
-      if (y > 0) neighbors.push(idx - w);
-      if (y < h - 1) neighbors.push(idx + w);
-      if (x > 0) neighbors.push(idx - 1);
-      if (x < w - 1) neighbors.push(idx + 1);
-
-      for (const ni of neighbors) {
-        if (isBlack[ni] && !label[ni]) {
-          label[ni] = componentId;
-          queue.push(ni);
-        }
+  // Pass 1: compute per-row dark pixel ratio
+  const rowDarkRatio = new Float32Array(h);
+  for (let y = 0; y < h; y++) {
+    let darkCount = 0;
+    for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * ch;
+      if (
+        oD[p] < BLACK_RESTORE_THRESHOLD &&
+        oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
+        oD[p + 2] < BLACK_RESTORE_THRESHOLD
+      ) {
+        darkCount++;
       }
     }
-
-    componentSizes.push(size);
+    rowDarkRatio[y] = darkCount / w;
   }
 
-  // Pass 3: restore only pixels belonging to large components
-  let restored = 0;
-  for (let i = 0; i < w * h; i++) {
-    if (label[i] && componentSizes[label[i]] >= MIN_COMPONENT_SIZE) {
-      const p = i * ch;
-      cD[p] = 0;
-      cD[p + 1] = 0;
-      cD[p + 2] = 0;
-      cD[p + 3] = 255;
-      restored++;
+  // Pass 2: restore black pixels only in rows that are 90%+ dark
+  for (let y = 0; y < h; y++) {
+    if (rowDarkRatio[y] < ROW_DARK_RATIO) continue;
+
+    for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * ch;
+      if (
+        oD[p] < BLACK_RESTORE_THRESHOLD &&
+        oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
+        oD[p + 2] < BLACK_RESTORE_THRESHOLD
+      ) {
+        cD[p] = 0;
+        cD[p + 1] = 0;
+        cD[p + 2] = 0;
+        cD[p + 3] = 255;
+      }
     }
   }
 
