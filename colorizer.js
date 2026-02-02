@@ -30,7 +30,7 @@ const QUALITY = (process.env.QUALITY || "medium").toLowerCase();
 const QUALITY_TIERS = {
   high: { maxWidth: Infinity },
   medium: { maxWidth: 1024 },
-  low: { maxWidth: 640 },
+  low: { maxWidth: 800 },
 };
 const TIER = QUALITY_TIERS[QUALITY] || QUALITY_TIERS.medium;
 

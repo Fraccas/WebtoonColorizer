@@ -124,7 +124,7 @@ The `QUALITY` setting controls the input resolution sent to the API. The model, 
 
 | Setting | `high` | `medium` (default) | `low` |
 |---|---|---|---|
-| Max input width | full resolution | 1024px | 640px |
+| Max input width | full resolution | 1024px | 800px |
 | API output size | up to 1536x1024 | up to 1024x1536 | 1024x1024 |
 
 **How it saves money:** Lower tiers downscale the input before sending it to the API, which means smaller API output sizes, fewer orchestrator vision tokens, and cheaper image generation. The colorized output is always upscaled back to the original dimensions.
