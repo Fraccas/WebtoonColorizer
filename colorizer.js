@@ -503,16 +503,24 @@ async function colorizeSegment(segBuf, index, total, prompt) {
 
   const apiOut = Buffer.from(b64, "base64");
 
-  // Crop out the padding, then resize back to original full-res dimensions
+  // Crop out the padding (still at working resolution)
   const cropped = await sharp(apiOut)
     .extract({ left: 0, top: 0, width: fitW, height: fitH })
-    .resize(origW, origH, { fit: "fill" })
+    .resize(workW, workH, { fit: "fill" })
     .png()
     .toBuffer();
 
-  // Force any pixel that was black in the original back to pure black
-  const restored = await restoreBlacks(segBuf, cropped);
+  // Restore blacks at working resolution so both images are at the same scale.
+  // This avoids jagged artifacts from comparing crisp originals against upscaled output.
+  const restored = await restoreBlacks(workBuf, cropped);
 
+  // Upscale to original full-res dimensions
+  if (workW !== origW || workH !== origH) {
+    return sharp(restored)
+      .resize(origW, origH, { fit: "fill" })
+      .png()
+      .toBuffer();
+  }
   return restored;
 }
 

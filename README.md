@@ -126,13 +126,17 @@ The `QUALITY` setting controls the input resolution sent to the API. The model, 
 |---|---|---|---|
 | Max input width | full resolution | 1024px | 800px |
 | API output size | up to 1536x1024 | up to 1024x1536 | 1024x1024 |
+| Text preservation | Perfect | Good | Garbled on dense text |
+| Est. cost (2 slices) | ~$0.56 | ~$0.36 | ~$0.20 |
 
 **How it saves money:** Lower tiers downscale the input before sending it to the API, which means smaller API output sizes, fewer orchestrator vision tokens, and cheaper image generation. The colorized output is always upscaled back to the original dimensions.
+
+**Tradeoffs:** Medium preserves text and artwork well. Low is useful for quick color/composition previews but will distort small text in speech bubbles — use it for iteration, not final output.
 
 ```env
 QUALITY=medium   # Good balance of quality and cost (default)
 QUALITY=high     # Best quality for final output
-QUALITY=low      # Cheapest — good for previews and iteration
+QUALITY=low      # Cheapest — previews only, text may be garbled
 ```
 
 ### Output Dimensions
@@ -208,14 +212,14 @@ The colorization uses the OpenAI Responses API with GPT-5.2 as the orchestrating
 
 ## Cost Estimates
 
-Cost is driven primarily by the image generation quality tier, not the orchestrating text model. Blank and text-on-black segments are skipped and cost nothing.
+Cost is driven by input resolution (quality tier) and number of API calls. Blank and text-on-black segments are skipped and cost nothing.
 
 | Scale | Slices | Est. API Calls | High | Medium | Low |
 |---|---|---|---|---|---|
-| Test (3 slices) | 3 | ~3 | ~$0.60 | ~$0.15 | ~$0.04 |
-| Full chapter (100 slices) | 100 | ~60–80 | ~$12–$16 | ~$3–$4 | ~$0.80–$1 |
+| Test (2 slices) | 2 | ~3 | ~$0.56 | ~$0.36 | ~$0.20 |
+| Full chapter (100 slices) | 100 | ~60–80 | ~$17–$22 | ~$11–$14 | ~$6–$8 |
 
-**How the estimate works:** A typical 3-slice test produces ~5 segments, of which ~2 are blank (skipped), leaving ~3 API calls. A 100-slice chapter has more panels but also more black dividers and text-on-black captions — assuming ~60–80 non-blank segments gives the ranges above.
+**Tested costs:** 2 input slices → 5 segments (2 skipped as blank/text-on-black) → 3 API calls. Costs above are from actual test runs. A 100-slice chapter will have more panels but also more skippable segments. Estimates assume ~60–80 non-blank segments.
 
 Costs may vary based on segment size, API pricing changes, and how many blank segments your webtoon has.
 
