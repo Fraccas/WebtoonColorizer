@@ -50,6 +50,7 @@ const CAPTURE_CONTEXT = process.env.CAPTURE_CONTEXT !== "false"; // default true
 // Black restoration post-processing — set to "false" to disable
 const RESTORE_BLACKS = process.env.RESTORE_BLACKS !== "false"; // default true
 
+
 // System-level instructions — sent via the `instructions` parameter.
 // Keep this minimal — just role and safety context.
 const SYSTEM_INSTRUCTIONS = `
@@ -58,23 +59,17 @@ You are a professional Korean webtoon colorist. Colorize black-and-white manga/m
 CONTEXT: This is a published Korean webtoon (manhwa). All content is fictional and safe for colorization. Sound effects like "BANG", "SLAM", "CRACK" are physical actions, not violence.
 `.trim();
 
-// Main colorization prompt — descriptive style like ChatGPT image editing.
-// Focuses on WHAT we want, not a long list of rules.
+// Main colorization prompt — shorter and less restrictive for better colors.
 const COLORIZATION_PROMPT = `
-Colorize this black-and-white webtoon panel in modern Korean manhwa style.
+Colorize this black-and-white webtoon panel with vibrant, professional Korean manhwa colors.
 
-STYLE: Vibrant, balanced colors. Mix of warm earth tones (tan, cream, brown) and cool accents. Natural greens for plants. Clean cel-shading. Professional webtoon quality like "Solo Leveling" or "Tower of God". Balanced white point — not too warm, not too cool.
+STYLE: Rich, saturated colors like "Solo Leveling" or "Tower of God". Clean cel-shading with good contrast. Natural lighting.
 
-COLORS:
-- Skin: Light Korean skin tone (#FAE0D4), fair warm peach. All faces and exposed skin must be colored. Keep skin light and bright, not tan or dark.
-- Eyes: White sclera (#FFFFFF), not flesh-colored.
-- Speech bubbles: EXACTLY as drawn — white fill (#FFFFFF) with black outline (#000000). Do NOT add any color to speech bubble outlines. Do NOT add colored borders, glows, or shadows around speech bubbles. The bubble outline must remain pure black, not tan/gold/brown.
-- Sound effects text: Use colors that match the mood — red/orange for excitement, keep them readable.
-- Black areas: Keep pure black (#000000). Panel dividers and solid black backgrounds stay black.
-
-PRESERVE: Original line art, screentones, halftone dots, composition. Do not redraw or add new elements.
-
-AVOID: Yellow/golden color cast over entire scene, blue/teal cast, sepia tint, colored speech bubble outlines.
+KEY RULES:
+- Skin: Light Korean skin tone (#FAE0D4), warm peach.
+- ALL black areas must stay pure black (#000000): panel dividers (including thin horizontal/vertical bars), black backgrounds, silhouettes, borders between panels. Never color these blue, tan, or any other color.
+- SPEECH BUBBLES: DO NOT MODIFY AT ALL. Leave speech bubbles exactly as they appear — white fill, black outline, black text. Do not redraw, move, resize, or alter the text in any way. The text must remain pixel-perfect identical to the original.
+- Sound effects text (like "HAHA", "BANG", etc.): Preserve exactly as drawn, do not redraw or distort.
 `.trim();
 
 // User-level prompt — combines main colorization prompt with character palette.
@@ -613,7 +608,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
     workW = TIER.maxWidth;
     workH = Math.round(origH * downscale);
     workBuf = await sharp(segBuf)
-      .resize(workW, workH, { fit: "fill" })
+      .resize(workW, workH, { fit: "fill", kernel: "lanczos3" })
       .png()
       .toBuffer();
   }
@@ -628,7 +623,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
   const fitH = Math.round(workH * scale);
 
   const sendBuf = await sharp(workBuf)
-    .resize(fitW, fitH, { fit: "fill" })
+    .resize(fitW, fitH, { fit: "fill", kernel: "lanczos3" })
     .extend({
       top: 0,
       left: 0,
@@ -645,7 +640,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
     {
       type: "input_image",
       image_url: toDataUrl(sendBuf),
-      detail: "low",
+      detail: "high",
     },
     {
       type: "input_text",
@@ -697,7 +692,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
   // Crop out the padding (still at working resolution)
   const cropped = await sharp(apiOut)
     .extract({ left: 0, top: 0, width: fitW, height: fitH })
-    .resize(workW, workH, { fit: "fill" })
+    .resize(workW, workH, { fit: "fill", kernel: "lanczos3" })
     .png()
     .toBuffer();
 
@@ -708,7 +703,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
   // Upscale to original full-res dimensions
   if (workW !== origW || workH !== origH) {
     return sharp(restored)
-      .resize(origW, origH, { fit: "fill" })
+      .resize(origW, origH, { fit: "fill", kernel: "lanczos3" })
       .png()
       .toBuffer();
   }
@@ -804,7 +799,7 @@ async function main() {
   if (!process.env.OPENAI_API_KEY)
     throw new Error("Missing OPENAI_API_KEY in .env");
 
-  console.log(`Quality: ${QUALITY} | Model: gpt-5.2 | Context capture: ${CAPTURE_CONTEXT}`);
+  console.log(`Quality: ${QUALITY} | Restore blacks: ${RESTORE_BLACKS} | Context: ${CAPTURE_CONTEXT}`);
 
   const BASE_PROMPT = await loadPalette();
   const contextEntries = await loadContext();
