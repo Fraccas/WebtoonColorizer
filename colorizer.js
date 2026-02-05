@@ -47,6 +47,9 @@ const MIN_SEGMENT_H = 100;
 // Intelligent context capture — learns color choices for unlocked elements.
 const CAPTURE_CONTEXT = process.env.CAPTURE_CONTEXT !== "false"; // default true
 
+// Black restoration post-processing — set to "false" to disable
+const RESTORE_BLACKS = process.env.RESTORE_BLACKS !== "false"; // default true
+
 // System-level instructions — sent via the `instructions` parameter.
 // Keep this minimal — just role and safety context.
 const SYSTEM_INSTRUCTIONS = `
@@ -63,7 +66,7 @@ Colorize this black-and-white webtoon panel in modern Korean manhwa style.
 STYLE: Vibrant, balanced colors. Mix of warm earth tones (tan, cream, brown) and cool accents. Natural greens for plants. Clean cel-shading. Professional webtoon quality like "Solo Leveling" or "Tower of God". Balanced white point — not too warm, not too cool.
 
 COLORS:
-- Skin: Light Korean skin tone (#F5D6C3), warm peach. All faces and exposed skin must be colored.
+- Skin: Light Korean skin tone (#FAE0D4), fair warm peach. All faces and exposed skin must be colored. Keep skin light and bright, not tan or dark.
 - Eyes: White sclera (#FFFFFF), not flesh-colored.
 - Speech bubbles: EXACTLY as drawn — white fill (#FFFFFF) with black outline (#000000). Do NOT add any color to speech bubble outlines. Do NOT add colored borders, glows, or shadows around speech bubbles. The bubble outline must remain pure black, not tan/gold/brown.
 - Sound effects text: Use colors that match the mood — red/orange for excitement, keep them readable.
@@ -410,21 +413,23 @@ async function isBlankSegment(buf) {
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
-// Hybrid approach: Edge-connected flood fill + local density verification
+// Hybrid approach: Edge-connected flood fill + speech bubble awareness
 //
-// Pure edge-connected flood fill is too aggressive — artwork black that
-// happens to touch the image edge gets restored incorrectly.
+// Problem: Speech bubbles (white) break edge-connectivity, leaving black
+// pixels around bubbles unrestored even though they're in black regions.
 //
-// Solution: A dark pixel is only restored if BOTH conditions are true:
-// 1. It's edge-connected (reachable from image border via dark pixels)
-// 2. It's in a high-density region (local 33x33 block is 70%+ dark)
-//
-// This prevents isolated artwork black near edges from being restored,
-// while still correctly restoring large structural black regions.
+// Solution:
+// 1. Find edge-connected dark pixels (flood fill from image borders)
+// 2. Also find dark pixels adjacent to large white regions (speech bubbles)
+//    that are in high-density black areas
+// 3. Restore dark pixels that are either edge-connected OR bubble-adjacent,
+//    but only if they're in a high-density region (70%+ dark locally)
 
-const BLACK_RESTORE_THRESHOLD = 5;  // RGB < 5 = "true black"
-const LOCAL_CHECK_RADIUS = 16;      // 33x33 block for density check
-const LOCAL_DENSITY_MIN = 0.70;     // block must be 70%+ dark
+const BLACK_RESTORE_THRESHOLD = 5;   // RGB < 5 = "true black"
+const WHITE_THRESHOLD = 250;          // RGB > 250 = "white" (speech bubbles)
+const LOCAL_CHECK_RADIUS = 16;        // 33x33 block for density check
+const LOCAL_DENSITY_MIN = 0.70;       // block must be 70%+ dark
+const BUBBLE_SEARCH_RADIUS = 3;       // how far to look for white pixels
 
 async function restoreBlacks(originalBuf, colorizedBuf) {
   const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -436,17 +441,18 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
   const h = origRaw.info.height;
   const ch = origRaw.info.channels;
 
-  // Build binary dark map
+  // Build binary maps for dark and white pixels
   const dark = new Uint8Array(w * h);
+  const white = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const p = (y * w + x) * ch;
-      if (
-        oD[p] < BLACK_RESTORE_THRESHOLD &&
-        oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
-        oD[p + 2] < BLACK_RESTORE_THRESHOLD
-      ) {
+      const r = oD[p], g = oD[p + 1], b = oD[p + 2];
+      if (r < BLACK_RESTORE_THRESHOLD && g < BLACK_RESTORE_THRESHOLD && b < BLACK_RESTORE_THRESHOLD) {
         dark[y * w + x] = 1;
+      }
+      if (r > WHITE_THRESHOLD && g > WHITE_THRESHOLD && b > WHITE_THRESHOLD) {
+        white[y * w + x] = 1;
       }
     }
   }
@@ -476,6 +482,21 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
     const d = y1 * sw + x1;
     const darkCount = sat[a] - sat[b] - sat[c] + sat[d];
     return darkCount / blockSize;
+  }
+
+  // Check if a pixel is near a white region (speech bubble)
+  function isNearWhite(cx, cy) {
+    const r = BUBBLE_SEARCH_RADIUS;
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+          if (white[ny * w + nx]) return true;
+        }
+      }
+    }
+    return false;
   }
 
   // Track which dark pixels are edge-connected
@@ -519,20 +540,24 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
     }
   }
 
-  // Restore pixels that are BOTH edge-connected AND in high-density regions
+  // Restore dark pixels that meet criteria
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = y * w + x;
-      if (!edgeConnected[idx]) continue;
+      if (!dark[idx]) continue;
 
-      // Check local density — only restore if in a dense black region
-      if (getLocalDensity(x, y) >= LOCAL_DENSITY_MIN) {
-        const p = idx * ch;
-        cD[p] = 0;
-        cD[p + 1] = 0;
-        cD[p + 2] = 0;
-        cD[p + 3] = 255;
-      }
+      // Must be in a high-density region
+      const density = getLocalDensity(x, y);
+      if (density < LOCAL_DENSITY_MIN) continue;
+
+      // Must be either edge-connected OR near a speech bubble
+      if (!edgeConnected[idx] && !isNearWhite(x, y)) continue;
+
+      const p = idx * ch;
+      cD[p] = 0;
+      cD[p + 1] = 0;
+      cD[p + 2] = 0;
+      cD[p + 3] = 255;
     }
   }
 
@@ -678,7 +703,7 @@ async function colorizeSegment(segBuf, index, total, prompt) {
 
   // Restore blacks at working resolution so both images are at the same scale.
   // This avoids jagged artifacts from comparing crisp originals against upscaled output.
-  const restored = await restoreBlacks(workBuf, cropped);
+  const restored = RESTORE_BLACKS ? await restoreBlacks(workBuf, cropped) : cropped;
 
   // Upscale to original full-res dimensions
   if (workW !== origW || workH !== origH) {
