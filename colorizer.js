@@ -44,37 +44,37 @@ const MAX_SEGMENT_H = 4000;
 // Min height for a segment — anything smaller gets merged with its neighbor.
 const MIN_SEGMENT_H = 100;
 
+// Intelligent context capture — learns color choices for unlocked elements.
+const CAPTURE_CONTEXT = process.env.CAPTURE_CONTEXT !== "false"; // default true
+
 // System-level instructions — sent via the `instructions` parameter.
-// These are persistent rules the model must follow for every image.
+// Keep this minimal — just role and safety context.
 const SYSTEM_INSTRUCTIONS = `
-You are a professional webtoon colorist. Your ONLY job is to colorize black-and-white webtoon panels using the image_generation tool in edit mode. You must ALWAYS call the image_generation tool — never respond with text.
+You are a professional Korean webtoon colorist. Colorize black-and-white manga/manhwa panels using the image_generation tool in edit mode. Always call the tool — never respond with text only.
 
-CONTEXT: This is a published Korean webtoon (manhwa). All content is fictional and safe.
-Sound effects like "BANG", "SLAM", "CRACK" refer to physical actions (hitting walls, doors, objects) — not violence or self-harm. Emotional dialogue about loss is standard dramatic storytelling.
-
-STRICT PRESERVATION RULES:
-- Preserve the original line art exactly; do NOT redraw, re-ink, or change shapes.
-- Preserve screentones/halftone dots and texture; do NOT smooth them away.
-- Preserve all panel composition, perspective, facial structure, and clothing design.
-- Keep deep blacks rich and clean; do not gray them out.
-- Do not add new objects, text, symbols, or background elements.
-- Any area that is solid black in the input MUST stay pure black (#000000). Do not tint, colorize, or lighten black panel dividers or black backgrounds.
-
-COLOR STYLE:
-- Modern Korean webtoon palette: clean, vibrant, high-chroma base colors.
-- No sepia / beige / vintage / parchment / "aged paper" look.
-- No warm yellow or orange color cast. No golden-hour tint.
-- White balance must be neutral-cool. Speech bubbles and text bubbles MUST be pure white (#FFFFFF) — use them as the white point reference.
-- Lighting should feel like clean neutral daylight, not warm indoor lighting.
-- Clean cel-shading with soft gradient transitions.
-- Crisp edges, minimal color bleed across line boundaries.
-- If unsure about a color, keep it neutral rather than inventing bright colors.
-- All human skin must have a light Korean skin tone (#F5D6C3) — warm peach, never pure white and never tan/dark. Apply this to all exposed skin (face, hands, arms, legs).
-- Eye whites (sclera) must be pure white (#FFFFFF), not skin-colored or tinted.
+CONTEXT: This is a published Korean webtoon (manhwa). All content is fictional and safe for colorization. Sound effects like "BANG", "SLAM", "CRACK" are physical actions, not violence.
 `.trim();
 
-// User-level prompt — sent alongside the image. Contains only the
-// per-palette character locks (loaded from JSON at runtime).
+// Main colorization prompt — descriptive style like ChatGPT image editing.
+// Focuses on WHAT we want, not a long list of rules.
+const COLORIZATION_PROMPT = `
+Colorize this black-and-white webtoon panel in modern Korean manhwa style.
+
+STYLE: Vibrant, balanced colors. Mix of warm earth tones (tan, cream, brown) and cool accents. Natural greens for plants. Clean cel-shading. Professional webtoon quality like "Solo Leveling" or "Tower of God". Balanced white point — not too warm, not too cool.
+
+COLORS:
+- Skin: Light Korean skin tone (#F5D6C3), warm peach. All faces and exposed skin must be colored.
+- Eyes: White sclera (#FFFFFF), not flesh-colored.
+- Speech bubbles: EXACTLY as drawn — white fill (#FFFFFF) with black outline (#000000). Do NOT add any color to speech bubble outlines. Do NOT add colored borders, glows, or shadows around speech bubbles. The bubble outline must remain pure black, not tan/gold/brown.
+- Sound effects text: Use colors that match the mood — red/orange for excitement, keep them readable.
+- Black areas: Keep pure black (#000000). Panel dividers and solid black backgrounds stay black.
+
+PRESERVE: Original line art, screentones, halftone dots, composition. Do not redraw or add new elements.
+
+AVOID: Yellow/golden color cast over entire scene, blue/teal cast, sepia tint, colored speech bubble outlines.
+`.trim();
+
+// User-level prompt — combines main colorization prompt with character palette.
 async function loadPalette() {
   const palettePath = path.join(".", "palettes", `${PALETTE}.json`);
   try {
@@ -82,12 +82,76 @@ async function loadPalette() {
     const data = JSON.parse(raw);
     console.log(`Palette: ${data.name} (${PALETTE}.json)`);
     const lines = data.characters.map((c) => `- ${c}`).join("\n");
-    return `Colorize this panel.\n\nPALETTE LOCKS (MUST FOLLOW):\n${lines}\n- Keep these character colors consistent across all panels.`;
+    // Combine main prompt with character-specific colors
+    return `${COLORIZATION_PROMPT}\n\nCHARACTERS:\n${lines}`;
   } catch (err) {
     if (err.code === "ENOENT") {
       throw new Error(`Palette file not found: ${palettePath}\nAvailable palettes are in the ./palettes/ directory.`);
     }
     throw err;
+  }
+}
+
+// ── Intelligent context system ────────────────────────────────────────────
+
+const CONTEXT_PATH = path.join(".", "palettes", `${PALETTE}_context.json`);
+
+async function loadContext() {
+  try {
+    const raw = await fsp.readFile(CONTEXT_PATH, "utf-8");
+    const data = JSON.parse(raw);
+    const entries = data.learned || [];
+    if (entries.length > 0) {
+      console.log(`Context: loaded ${entries.length} learned color(s) from ${PALETTE}_context.json`);
+    }
+    return entries;
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+}
+
+async function saveContext(entries) {
+  await fsp.writeFile(CONTEXT_PATH, JSON.stringify({ learned: entries }, null, 2));
+}
+
+function buildPromptWithContext(basePrompt, contextEntries) {
+  if (contextEntries.length === 0) return basePrompt;
+  const contextBlock = contextEntries.map((c) => `- ${c}`).join("\n");
+  return `${basePrompt}\n\nPREVIOUSLY LEARNED COLORS (use these for consistency, but override if clearly wrong):\n${contextBlock}`;
+}
+
+async function captureContext(colorizedBuf, palettePrompt) {
+  try {
+    const res = await client.responses.create({
+      model: "gpt-5.2",
+      instructions: "You analyze colorized webtoon panels. Return ONLY a JSON array of short strings describing colors you observe for elements NOT already specified in the palette (e.g., backgrounds, furniture, unnamed clothing, objects). Each string should be like: \"hospital hallway: pale mint-green walls (#D4E8D6)\". If nothing notable, return an empty array [].",
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_image", image_url: toDataUrl(colorizedBuf), detail: "low" },
+          { type: "input_text", text: `Here is the palette that was already specified:\n${palettePrompt}\n\nList colors chosen for elements NOT in the palette above. Return a JSON array of strings. Be concise — only notable/reusable colors.` },
+        ],
+      }],
+    });
+
+    // Extract text response
+    for (const item of res.output) {
+      if (item.type === "message" && item.content) {
+        for (const c of item.content) {
+          if (c.text) {
+            // Parse JSON array from response (handle markdown code fences)
+            const cleaned = c.text.replace(/```json?\s*/g, "").replace(/```/g, "").trim();
+            const arr = JSON.parse(cleaned);
+            if (Array.isArray(arr)) return arr.filter((s) => typeof s === "string" && s.length > 0);
+          }
+        }
+      }
+    }
+    return [];
+  } catch (err) {
+    console.warn(`    Context capture failed (non-fatal): ${err.message}`);
+    return [];
   }
 }
 
@@ -265,6 +329,47 @@ async function splitAtPoints(stitchedBuf, width, totalH, splitPoints) {
   return result;
 }
 
+// ── Retry helper ────────────────────────────────────────────────────────────
+
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 2000;
+
+function isTransient(err) {
+  // Rate limits, server errors, timeouts, network failures
+  if (err.status === 429 || (err.status >= 500 && err.status < 600)) return true;
+  if (/timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|network/i.test(err.message)) return true;
+  if (/safety|content_policy|moderation/i.test(err.message)) return true;
+  return false;
+}
+
+async function withRetry(fn, label) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isSafety = /safety|content_policy|moderation/i.test(err.message);
+      const retriable = isTransient(err);
+
+      if (!retriable || attempt === MAX_RETRIES) {
+        // Non-transient or exhausted retries — return null to signal failure
+        const reason = isSafety ? "safety filter" : err.message;
+        console.warn(`    WARNING: ${label} failed after ${attempt + 1} attempt(s): ${reason}`);
+        return null;
+      }
+
+      // Compute delay: respect Retry-After header if present, otherwise exponential backoff
+      let delay = BASE_DELAY_MS * Math.pow(2, attempt);
+      if (err.headers?.["retry-after"]) {
+        const ra = Number(err.headers["retry-after"]);
+        if (!isNaN(ra)) delay = ra * 1000;
+      }
+      const tag = isSafety ? "safety filter" : `${err.status || "network error"}`;
+      console.log(`    ${tag} — retry ${attempt + 1}/${MAX_RETRIES} in ${(delay / 1000).toFixed(1)}s...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 // ── Step 4: Colorize a segment via Responses API ────────────────────────────
 
 async function isBlankSegment(buf) {
@@ -305,15 +410,21 @@ async function isBlankSegment(buf) {
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
-// Uses row-density analysis to identify structural black regions (panel
-// dividers, black backgrounds) and forces them back to pure black.
-// Only restores pixels in rows where 90%+ of pixels are dark — these are
-// structural rows (dividers, full-width black bands), not artwork rows.
-// Artwork rows with characters, shadows, line art, etc. are never touched,
-// even if they contain black pixels, because they never reach 90% density.
+// Hybrid approach: Edge-connected flood fill + local density verification
+//
+// Pure edge-connected flood fill is too aggressive — artwork black that
+// happens to touch the image edge gets restored incorrectly.
+//
+// Solution: A dark pixel is only restored if BOTH conditions are true:
+// 1. It's edge-connected (reachable from image border via dark pixels)
+// 2. It's in a high-density region (local 33x33 block is 70%+ dark)
+//
+// This prevents isolated artwork black near edges from being restored,
+// while still correctly restoring large structural black regions.
 
-const BLACK_RESTORE_THRESHOLD = 5; // RGB < 5 = "true black"
-const ROW_DARK_RATIO = 0.90;       // row must be 90%+ dark to be restorable
+const BLACK_RESTORE_THRESHOLD = 5;  // RGB < 5 = "true black"
+const LOCAL_CHECK_RADIUS = 16;      // 33x33 block for density check
+const LOCAL_DENSITY_MIN = 0.70;     // block must be 70%+ dark
 
 async function restoreBlacks(originalBuf, colorizedBuf) {
   const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -325,10 +436,9 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
   const h = origRaw.info.height;
   const ch = origRaw.info.channels;
 
-  // Pass 1: compute per-row dark pixel ratio
-  const rowDarkRatio = new Float32Array(h);
+  // Build binary dark map
+  const dark = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
-    let darkCount = 0;
     for (let x = 0; x < w; x++) {
       const p = (y * w + x) * ch;
       if (
@@ -336,23 +446,88 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
         oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
         oD[p + 2] < BLACK_RESTORE_THRESHOLD
       ) {
-        darkCount++;
+        dark[y * w + x] = 1;
       }
     }
-    rowDarkRatio[y] = darkCount / w;
   }
 
-  // Pass 2: restore black pixels only in rows that are 90%+ dark
-  for (let y = 0; y < h; y++) {
-    if (rowDarkRatio[y] < ROW_DARK_RATIO) continue;
+  // Build summed area table for O(1) local density queries
+  const sat = new Int32Array((w + 1) * (h + 1));
+  const sw = w + 1;
+  for (let y = 1; y <= h; y++) {
+    for (let x = 1; x <= w; x++) {
+      sat[y * sw + x] =
+        dark[(y - 1) * w + (x - 1)] +
+        sat[(y - 1) * sw + x] +
+        sat[y * sw + (x - 1)] -
+        sat[(y - 1) * sw + (x - 1)];
+    }
+  }
 
+  function getLocalDensity(cx, cy) {
+    const x1 = Math.max(0, cx - LOCAL_CHECK_RADIUS);
+    const y1 = Math.max(0, cy - LOCAL_CHECK_RADIUS);
+    const x2 = Math.min(w - 1, cx + LOCAL_CHECK_RADIUS);
+    const y2 = Math.min(h - 1, cy + LOCAL_CHECK_RADIUS);
+    const blockSize = (x2 - x1 + 1) * (y2 - y1 + 1);
+    const a = (y2 + 1) * sw + (x2 + 1);
+    const b = y1 * sw + (x2 + 1);
+    const c = (y2 + 1) * sw + x1;
+    const d = y1 * sw + x1;
+    const darkCount = sat[a] - sat[b] - sat[c] + sat[d];
+    return darkCount / blockSize;
+  }
+
+  // Track which dark pixels are edge-connected
+  const edgeConnected = new Uint8Array(w * h);
+
+  // Seed queue with all dark pixels on image borders
+  const queue = [];
+  for (let x = 0; x < w; x++) {
+    if (dark[x]) queue.push(x);
+    const bottomIdx = (h - 1) * w + x;
+    if (dark[bottomIdx]) queue.push(bottomIdx);
+  }
+  for (let y = 1; y < h - 1; y++) {
+    const leftIdx = y * w;
+    if (dark[leftIdx]) queue.push(leftIdx);
+    const rightIdx = y * w + (w - 1);
+    if (dark[rightIdx]) queue.push(rightIdx);
+  }
+
+  for (const idx of queue) {
+    edgeConnected[idx] = 1;
+  }
+
+  // Flood-fill to find all edge-connected dark pixels
+  while (queue.length > 0) {
+    const idx = queue.pop();
+    const x = idx % w;
+    const y = Math.floor(idx / w);
+
+    const neighbors = [];
+    if (x > 0) neighbors.push(idx - 1);
+    if (x < w - 1) neighbors.push(idx + 1);
+    if (y > 0) neighbors.push(idx - w);
+    if (y < h - 1) neighbors.push(idx + w);
+
+    for (const nIdx of neighbors) {
+      if (dark[nIdx] && !edgeConnected[nIdx]) {
+        edgeConnected[nIdx] = 1;
+        queue.push(nIdx);
+      }
+    }
+  }
+
+  // Restore pixels that are BOTH edge-connected AND in high-density regions
+  for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const p = (y * w + x) * ch;
-      if (
-        oD[p] < BLACK_RESTORE_THRESHOLD &&
-        oD[p + 1] < BLACK_RESTORE_THRESHOLD &&
-        oD[p + 2] < BLACK_RESTORE_THRESHOLD
-      ) {
+      const idx = y * w + x;
+      if (!edgeConnected[idx]) continue;
+
+      // Check local density — only restore if in a dense black region
+      if (getLocalDensity(x, y) >= LOCAL_DENSITY_MIN) {
+        const p = idx * ch;
         cD[p] = 0;
         cD[p + 1] = 0;
         cD[p + 2] = 0;
@@ -604,9 +779,11 @@ async function main() {
   if (!process.env.OPENAI_API_KEY)
     throw new Error("Missing OPENAI_API_KEY in .env");
 
-  console.log(`Quality: ${QUALITY} | Model: gpt-5.2`);
+  console.log(`Quality: ${QUALITY} | Model: gpt-5.2 | Context capture: ${CAPTURE_CONTEXT}`);
 
-  const PROMPT = await loadPalette();
+  const BASE_PROMPT = await loadPalette();
+  const contextEntries = await loadContext();
+  const PROMPT = buildPromptWithContext(BASE_PROMPT, contextEntries);
 
   await ensureDir(OUTPUT_DIR);
 
@@ -647,14 +824,15 @@ async function main() {
   }
 
   // 5. Colorize each segment
-  const MAX_RETRIES = 2;
   let apiCalls = 0;
   let skippedSegments = 0;
+  const failedIndices = [];
   console.log("Colorizing segments...");
   const colorizedSegments = [];
   for (let i = 0; i < segments.length; i++) {
+    const progress = `[${i + 1}/${segments.length}, ${apiCalls} API calls, ${failedIndices.length} failed, ${skippedSegments} skipped]`;
     console.log(
-      `  Segment ${i + 1}/${segments.length} (${segments[i].width}x${segments[i].height})...`
+      `  ${progress} Segment ${i + 1} (${segments[i].width}x${segments[i].height})...`
     );
 
     // Check if segment is blank/text-on-black before making API call
@@ -666,29 +844,30 @@ async function main() {
       colorized = segments[i].buffer;
       skippedSegments++;
     } else {
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          colorized = await colorizeSegment(
-            segments[i].buffer,
-            i,
-            segments.length,
-            PROMPT
-          );
+      colorized = await withRetry(
+        () => {
           apiCalls++;
-          break;
-        } catch (err) {
-          const isSafety = /safety|content_policy|moderation/i.test(err.message);
-          if (isSafety && attempt < MAX_RETRIES) {
-            console.log(`    Safety filter triggered — retrying (${attempt + 1}/${MAX_RETRIES})...`);
-            apiCalls++; // retry still costs
-            continue;
+          return colorizeSegment(segments[i].buffer, i, segments.length, PROMPT);
+        },
+        `Segment ${i + 1}/${segments.length}`
+      );
+
+      if (colorized === null) {
+        // All retries exhausted — fall back to B&W
+        console.warn(`    → Using original B&W for segment ${i + 1}`);
+        colorized = segments[i].buffer;
+        failedIndices.push(i + 1);
+      } else if (CAPTURE_CONTEXT) {
+        // Capture color decisions for unlocked elements
+        const newColors = await captureContext(colorized, BASE_PROMPT);
+        if (newColors.length > 0) {
+          // Deduplicate against existing entries
+          const existing = new Set(contextEntries.map((e) => e.toLowerCase()));
+          const unique = newColors.filter((c) => !existing.has(c.toLowerCase()));
+          if (unique.length > 0) {
+            contextEntries.push(...unique);
+            console.log(`    Context: +${unique.length} learned (${contextEntries.length} total)`);
           }
-          if (isSafety) {
-            console.warn(`    WARNING: Segment ${i + 1} blocked by safety filter after ${MAX_RETRIES} retries — using original B&W`);
-            colorized = segments[i].buffer;
-            break;
-          }
-          throw err; // non-safety errors still crash
         }
       }
     }
@@ -700,7 +879,17 @@ async function main() {
     await debugSave(`03_segment_${pad(i + 1)}_colorized.png`, colorized);
   }
 
-  console.log(`\nAPI summary: ${apiCalls} calls, ${skippedSegments} skipped (quality: ${QUALITY})`);
+  // Final summary
+  console.log(`\nAPI summary: ${apiCalls} calls, ${skippedSegments} skipped, ${failedIndices.length} failed (quality: ${QUALITY})`);
+  if (failedIndices.length > 0) {
+    console.warn(`Failed segments (fell back to B&W): ${failedIndices.join(", ")}`);
+  }
+
+  // Save learned context
+  if (CAPTURE_CONTEXT && contextEntries.length > 0) {
+    await saveContext(contextEntries);
+    console.log(`Context saved: ${contextEntries.length} entries → ${CONTEXT_PATH}`);
+  }
 
   // 6. Reassemble
   console.log("Reassembling...");
