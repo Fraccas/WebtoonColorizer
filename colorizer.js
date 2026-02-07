@@ -63,6 +63,12 @@ CONTEXT: This is a published Korean webtoon (manhwa). All content is fictional a
 const COLORIZATION_PROMPT = `
 Colorize this black-and-white webtoon panel with vibrant, professional Korean manhwa colors.
 
+CRITICAL — PRESERVATION: This is a COLORIZATION task, NOT redrawing. You must:
+- Keep ALL original line art exactly as-is — do not redraw or modify lines
+- Preserve exact proportions, expressions, poses, and compositions
+- Maintain original positions and sizes of all elements
+- Only ADD COLOR to existing artwork — never reshape, resize, or reposition anything
+
 STYLE: Rich, saturated colors like "Solo Leveling" or "Tower of God". Clean cel-shading with good contrast. Natural lighting.
 
 KEY RULES:
@@ -408,23 +414,14 @@ async function isBlankSegment(buf) {
 }
 
 // ── Post-process: restore black pixels from original ─────────────────────
-// Hybrid approach: Edge-connected flood fill + speech bubble awareness
-//
-// Problem: Speech bubbles (white) break edge-connectivity, leaving black
-// pixels around bubbles unrestored even though they're in black regions.
-//
-// Solution:
-// 1. Find edge-connected dark pixels (flood fill from image borders)
-// 2. Also find dark pixels adjacent to large white regions (speech bubbles)
-//    that are in high-density black areas
-// 3. Restore dark pixels that are either edge-connected OR bubble-adjacent,
-//    but only if they're in a high-density region (70%+ dark locally)
+// Edge-connected flood fill approach:
+// 1. Find dark pixels (RGB < 5) connected to image borders via flood fill
+// 2. Only restore if in a high-density region (92%+ dark locally)
+// This catches panel dividers and black backgrounds while avoiding shadows
 
 const BLACK_RESTORE_THRESHOLD = 5;   // RGB < 5 = "true black"
-const WHITE_THRESHOLD = 250;          // RGB > 250 = "white" (speech bubbles)
 const LOCAL_CHECK_RADIUS = 16;        // 33x33 block for density check
-const LOCAL_DENSITY_MIN = 0.70;       // block must be 70%+ dark
-const BUBBLE_SEARCH_RADIUS = 3;       // how far to look for white pixels
+const LOCAL_DENSITY_MIN = 0.92;       // block must be 92%+ dark (higher = fewer false positives on shadows)
 
 async function restoreBlacks(originalBuf, colorizedBuf) {
   const origRaw = await sharp(originalBuf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
@@ -436,18 +433,14 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
   const h = origRaw.info.height;
   const ch = origRaw.info.channels;
 
-  // Build binary maps for dark and white pixels
+  // Build binary map for dark pixels
   const dark = new Uint8Array(w * h);
-  const white = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const p = (y * w + x) * ch;
       const r = oD[p], g = oD[p + 1], b = oD[p + 2];
       if (r < BLACK_RESTORE_THRESHOLD && g < BLACK_RESTORE_THRESHOLD && b < BLACK_RESTORE_THRESHOLD) {
         dark[y * w + x] = 1;
-      }
-      if (r > WHITE_THRESHOLD && g > WHITE_THRESHOLD && b > WHITE_THRESHOLD) {
-        white[y * w + x] = 1;
       }
     }
   }
@@ -477,21 +470,6 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
     const d = y1 * sw + x1;
     const darkCount = sat[a] - sat[b] - sat[c] + sat[d];
     return darkCount / blockSize;
-  }
-
-  // Check if a pixel is near a white region (speech bubble)
-  function isNearWhite(cx, cy) {
-    const r = BUBBLE_SEARCH_RADIUS;
-    for (let dy = -r; dy <= r; dy++) {
-      for (let dx = -r; dx <= r; dx++) {
-        const nx = cx + dx;
-        const ny = cy + dy;
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-          if (white[ny * w + nx]) return true;
-        }
-      }
-    }
-    return false;
   }
 
   // Track which dark pixels are edge-connected
@@ -545,8 +523,8 @@ async function restoreBlacks(originalBuf, colorizedBuf) {
       const density = getLocalDensity(x, y);
       if (density < LOCAL_DENSITY_MIN) continue;
 
-      // Must be either edge-connected OR near a speech bubble
-      if (!edgeConnected[idx] && !isNearWhite(x, y)) continue;
+      // Must be edge-connected (removed "near speech bubble" logic - it caused artifacts)
+      if (!edgeConnected[idx]) continue;
 
       const p = idx * ch;
       cD[p] = 0;
@@ -663,6 +641,19 @@ async function colorizeSegment(segBuf, index, total, prompt) {
       },
     ],
   });
+
+  // Log usage/cost if available
+  let segmentCost = 0;
+  if (res.usage) {
+    const inputTokens = res.usage.input_tokens || 0;
+    const outputTokens = res.usage.output_tokens || 0;
+    // Image generation is the main cost - varies by quality
+    // high: ~$0.32, medium: ~$0.12, low: ~$0.04 per image (approximate)
+    const imgCost = QUALITY === "high" ? 0.32 : QUALITY === "medium" ? 0.12 : 0.04;
+    const tokenCost = (inputTokens * 0.01 + outputTokens * 0.03) / 1000;
+    segmentCost = imgCost + tokenCost;
+    console.log(`    Cost: ~$${segmentCost.toFixed(3)} (img: $${imgCost.toFixed(2)}, tokens: ${inputTokens}+${outputTokens})`);
+  }
 
   // Find image output
   let b64 = null;
@@ -899,8 +890,11 @@ async function main() {
     await debugSave(`03_segment_${pad(i + 1)}_colorized.png`, colorized);
   }
 
-  // Final summary
-  console.log(`\nAPI summary: ${apiCalls} calls, ${skippedSegments} skipped, ${failedIndices.length} failed (quality: ${QUALITY})`);
+  // Final summary with cost estimate
+  const estCostPerCall = QUALITY === "high" ? 0.32 : QUALITY === "medium" ? 0.12 : 0.04;
+  const estTotalCost = apiCalls * estCostPerCall;
+  console.log(`\nAPI summary: ${apiCalls} calls, ${skippedSegments} skipped, ${failedIndices.length} failed`);
+  console.log(`Estimated cost: ~$${estTotalCost.toFixed(2)} (${QUALITY} quality @ ~$${estCostPerCall.toFixed(2)}/image)`);
   if (failedIndices.length > 0) {
     console.warn(`Failed segments (fell back to B&W): ${failedIndices.join(", ")}`);
   }
